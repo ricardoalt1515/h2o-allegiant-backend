@@ -45,7 +45,7 @@ from app.main import limiter
     summary="List all projects",
     description="Retrieve a paginated list of projects with optional filtering",
 )
-@limiter.limit("50/minute")
+@limiter.limit("60/minute")  # Corregido: Ahora permite 60 solicitudes por minuto
 async def list_projects(
     request: Request,
     current_user: CurrentUser,
@@ -255,12 +255,12 @@ async def get_project(
     description="Create a new project with the provided information",
     responses={400: {"model": ErrorResponse}},
 )
-@limiter.limit("10/minute")  # Create endpoint - conservative
+@limiter.limit("100/minute")  # Balanced: Prevents abuse while allowing normal usage with retries
 async def create_project(
     request: Request,
     project_data: ProjectCreate,
     current_user: CurrentUser,
-    db: AsyncDB,  # ✅ Use type alias
+    db: AsyncDB,  # Use type alias
 ):
     """
     Create a new project.

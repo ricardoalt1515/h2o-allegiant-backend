@@ -79,10 +79,28 @@ logger = structlog.get_logger(__name__)
 # Ensure log directory exists
 os.makedirs(os.path.dirname(settings.LOG_FILE), exist_ok=True)
 
-# Rate Limiter Configuration (slowapi best practice)
-# No default_limits - each endpoint defines its own limit
-limiter = Limiter(key_func=get_remote_address)
-logger.info("✅ Rate limiter initialized (granular limits per endpoint)")
+# Rate Limiter Configuration (slowapi with Redis backend)
+# Redis-backed storage for distributed rate limiting across multiple ECS tasks
+# This ensures rate limits work correctly when auto-scaling (>1 task)
+def get_redis_url() -> str:
+    """Get Redis URL for rate limiter storage."""
+    if settings.REDIS_PASSWORD:
+        return f"redis://:{settings.REDIS_PASSWORD}@{settings.REDIS_HOST}:{settings.REDIS_PORT}/{settings.REDIS_DB}"
+    return f"redis://{settings.REDIS_HOST}:{settings.REDIS_PORT}/{settings.REDIS_DB}"
+
+# Use Redis storage if available, fallback to in-memory for local dev
+try:
+    limiter = Limiter(
+        key_func=get_remote_address,
+        storage_uri=get_redis_url(),
+        strategy="fixed-window"
+    )
+    logger.info("✅ Rate limiter initialized with Redis backend (distributed)")
+except Exception as e:
+    # Fallback to in-memory for local development
+    logger.warning(f"⚠️ Redis unavailable, using in-memory rate limiting: {e}")
+    limiter = Limiter(key_func=get_remote_address)
+    logger.info("✅ Rate limiter initialized with in-memory storage (local only)")
 
 
 @asynccontextmanager
@@ -95,10 +113,16 @@ async def lifespan(app: FastAPI):
     logger.info(f"Environment: {settings.ENVIRONMENT}")
     logger.info(f"Debug mode: {settings.DEBUG}")
     
+    # Validate configuration before accepting traffic
+    from app.core.startup_checks import validate_required_secrets, validate_production_config
+    validate_required_secrets()
+    validate_production_config()
+    
     # Initialize database (only in development)
-    if settings.DEBUG:
-        logger.warning("Debug mode: initializing database tables...")
-        await init_db()
+    # DISABLED: Use Alembic migrations instead
+    # if settings.DEBUG:
+    #     logger.warning("Debug mode: initializing database tables...")
+    #     await init_db()
     
     # Initialize Redis cache
     from app.services.cache_service import cache_service
@@ -175,12 +199,10 @@ AUTH_ENDPOINT_LIMITS = {
 @app.middleware("http")
 async def granular_rate_limit_middleware(request: Request, call_next):
     """
-    Apply granular rate limits to auth endpoints.
+    Apply granular rate limits to auth endpoints using Redis.
+    Redis-backed for distributed rate limiting across multiple ECS tasks.
     Custom endpoints use @limiter.limit() decorators instead.
     """
-    import json
-    from starlette.responses import StreamingResponse
-
     path = request.url.path
     method = request.method
 
@@ -192,51 +214,45 @@ async def granular_rate_limit_middleware(request: Request, call_next):
             # Parse limit string (e.g., "5/minute")
             count, period = limit_str.split("/")
             count = int(count)
-
+            
             # Get client IP
             client_ip = get_remote_address(request)
-
-            # Create cache key
+            
+            # Create cache key for Redis
             cache_key = f"rate_limit:{path}:{client_ip}"
-
-            # Check rate limit using simple in-memory dict
-            # TODO: Migrate to Redis for production multi-instance
-            import time
-            if not hasattr(app.state, "rate_limit_cache"):
-                app.state.rate_limit_cache = {}
-
-            current_time = time.time()
-
-            # Initialize or get existing timestamps
-            if cache_key not in app.state.rate_limit_cache:
-                app.state.rate_limit_cache[cache_key] = []
-
-            # Clean old timestamps (older than 60 seconds)
-            app.state.rate_limit_cache[cache_key] = [
-                ts for ts in app.state.rate_limit_cache[cache_key]
-                if current_time - ts < 60
-            ]
-
-            # Check if limit exceeded
-            if len(app.state.rate_limit_cache[cache_key]) >= count:
-                logger.warning(f"Rate limit exceeded: {path} from {client_ip}")
-                return JSONResponse(
-                    status_code=429,
-                    content={
-                        "error": {
-                            "message": "Too many requests. Please try again later.",
-                            "code": "RATE_LIMIT_EXCEEDED",
-                        }
-                    },
-                    headers={"Retry-After": "60"}
-                )
-
-            # Add current timestamp
-            app.state.rate_limit_cache[cache_key].append(current_time)
+            
+            # Use Redis for distributed rate limiting
+            from app.services.cache_service import cache_service
+            
+            if cache_service._redis:
+                # Increment counter in Redis
+                current_count = await cache_service._redis.incr(cache_key)
+                
+                # Set expiration on first request (60 seconds for "per minute")
+                if current_count == 1:
+                    await cache_service._redis.expire(cache_key, 60)
+                
+                # Check if limit exceeded
+                if current_count > count:
+                    logger.warning(f"Rate limit exceeded: {path} from {client_ip} ({current_count}/{count})")
+                    return JSONResponse(
+                        status_code=429,
+                        content={
+                            "error": {
+                                "message": "Too many requests. Please try again later.",
+                                "code": "RATE_LIMIT_EXCEEDED",
+                            }
+                        },
+                        headers={"Retry-After": "60"}
+                    )
+            else:
+                # Fallback: If Redis unavailable, allow request (fail open)
+                # This prevents blocking users if Redis is down
+                logger.warning(f"Redis unavailable for rate limiting, allowing request: {path}")
 
         except Exception as e:
             logger.error(f"Rate limit check failed: {e}")
-            # Don't block request if rate limiting fails
+            # Don't block request if rate limiting fails (fail open for availability)
 
     # Continue with request
     response = await call_next(request)

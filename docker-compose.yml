@@ -9,88 +9,50 @@ services:
       - ./logs:/app/logs
     ports:
       - "8000:8000"
+    
+    # ✅ Load all variables from .env file
+    env_file:
+      - .env
+    
+    # Override only Docker-specific values
     environment:
-      # Application
-      - APP_NAME=H2O Allegiant API
-      - APP_VERSION=1.0.0
-      - ENVIRONMENT=development
-      - DEBUG=true
-
-      # API
-      - API_V1_PREFIX=/api/v1
-      - BACKEND_URL=http://localhost:8000
-
-      # CORS
-      - CORS_ORIGINS=http://localhost:3000,http://localhost:3001
-
-      # Database
-      - POSTGRES_USER=h2o_user
-      - POSTGRES_PASSWORD=h2o_password
-      - POSTGRES_SERVER=postgres
-      - POSTGRES_PORT=5432
-      - POSTGRES_DB=h2o_allegiant
-
-      # Redis
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      - REDIS_DB=0
-      - REDIS_PASSWORD=
-
-      # Security
-      - SECRET_KEY=dev-secret-key-change-in-production-min-32-chars-long
-      - ALGORITHM=HS256
-      - ACCESS_TOKEN_EXPIRE_MINUTES=1440
-
-      # OpenAI (REQUERIDO - Agregar tu API key)
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      - OPENAI_MODEL=gpt-5-mini
-      - OPENAI_TEMPERATURE=0.7
-      - OPENAI_MAX_TOKENS=4000
-
-      # Storage
-      - USE_LOCAL_STORAGE=true
-      - LOCAL_STORAGE_PATH=/app/storage
-
-      # File Upload
-      - MAX_UPLOAD_SIZE=10485760
-      - ALLOWED_EXTENSIONS=.pdf,.docx,.xlsx,.jpg,.png
-
-      # Logging
-      - LOG_LEVEL=INFO
-      - LOG_FILE=/app/logs/app.log
-
+      - POSTGRES_SERVER=postgres  # Docker service name
+      - REDIS_HOST=redis          # Docker service name
+      - LOCAL_STORAGE_PATH=/app/storage  # Container path
+      - LOG_FILE=/app/logs/app.log       # Container path
+    
     depends_on:
-      - postgres
-      - redis
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     command:
-      [
-        "gunicorn",
-        "app.main:app",
-        "--workers",
-        "1",
-        "--worker-class",
-        "uvicorn.workers.UvicornWorker",
-        "--bind",
-        "0.0.0.0:8000",
-        "--log-level",
-        "debug",
-        "--reload",
-        "--timeout",
-        "120",
-      ]
+      - gunicorn
+      - app.main:app
+      - --workers=1
+      - --worker-class=uvicorn.workers.UvicornWorker
+      - --bind=0.0.0.0:8000
+      - --reload
+      - --log-level=debug
+      - --timeout=120
 
   postgres:
     image: postgres:14
     ports:
       - "5432:5432"
+    
+    # ✅ Load DB credentials from .env
+    env_file:
+      - .env
+    
     environment:
-      - POSTGRES_USER=h2o_user
-      - POSTGRES_PASSWORD=h2o_password
-      - POSTGRES_DB=h2o_allegiant
+      - POSTGRES_INITDB_ARGS=-E UTF8
+    
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U h2o_user -d h2o_allegiant"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 10s
       timeout: 5s
       retries: 5

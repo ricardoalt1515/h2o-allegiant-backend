@@ -19,8 +19,6 @@ from app.core.database import Base
 from app.models import (
     User,
     Project,
-    TechnicalSection,
-    TechnicalField,
     Proposal,
     ProjectFile,
     TimelineEvent,

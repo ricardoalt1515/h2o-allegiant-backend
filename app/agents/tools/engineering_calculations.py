@@ -122,30 +122,50 @@ def calculate_mass_balance(
     """
     Calculate contaminant mass loading with automatic unit conversion.
     
+    **When to use:** After retrieving raw influent data, as first engineering calculation.
+    **When NOT to use:** Do not call multiple times for the same influent data.
+    
     This is PURE MATHEMATICS - no LLM involved, fully reproducible.
     Formula: Load (kg/day) = Flow (m³/day) × Concentration (mg/L) × 0.001
     
-    Supports multiple input formats:
-    1. Simple dict with values in mg/L: {"BOD": 3700, "COD": 8500}
-    2. Structured dict with units: {"BOD": {"value": 3700, "unit": "mg/L"}}
-    3. String format: {"BOD": "3700 mg/L", "COD": "8.5 g/L"}
+    SUPPORTED FORMATS:
+    ✅ CORRECT: {"BOD": 3700, "COD": 8500, "TSS": 1200}
+    ✅ CORRECT: {"BOD": {"value": 3700, "unit": "mg/L"}}
+    ✅ CORRECT: {"BOD": "3700 mg/L", "COD": "8.5 g/L"}
     
-    Automatically converts all concentrations to mg/L before calculation.
+    REJECTED FORMATS (will raise ValueError):
+    ❌ WRONG: {"BOD": [3700], "COD": [8500]}  # No lists/arrays
+    ❌ WRONG: {"BOD": {"value": [3700], "unit": "mg/L"}}  # No nested lists
+    ❌ WRONG: {"BOD": "high", "COD": "medium"}  # No text descriptions
+    ❌ WRONG: {}  # Empty dict not allowed
     
     Args:
-        flow_m3_day: Flow rate in cubic meters per day (m³/d)
-        concentrations: Parameter concentrations in various formats
+        flow_m3_day: Flow rate in m³/day (e.g., 230.0)
+                    Must be positive number.
+        concentrations: Dict with parameter names as keys and concentrations as values.
+                       Each concentration can be:
+                       - Number (assumes mg/L): 3700
+                       - String with unit: "3700 mg/L" or "8.5 g/L"
+                       - Dict with value and unit: {"value": 3700, "unit": "mg/L"}
                        
     Returns:
-        Dict containing:
-            - loads: Dict of parameter loads with formulas and conversion trace
-            - total_organic_load_cod_kg_day: Total COD load
-            - calculation_method: Method used
-            - reproducible: Always True
-            - timestamp: Calculation timestamp
+        Dict with structure:
+        {
+            "loads": {
+                "BOD": {
+                    "load_kg_day": 851.0,
+                    "formula": "230 m³/d × 3700 mg/L × 0.001",
+                    "concentration_mg_l": 3700,
+                    "verified": True
+                }
+            },
+            "total_organic_load_cod_kg_day": 1955.0,
+            "calculation_method": "standard_mass_balance_with_unit_conversion",
+            "reproducible": True
+        }
             
     Raises:
-        ValueError: If inputs are invalid or units unsupported
+        ValueError: If concentrations is empty, contains lists, or has invalid types
             
     Example:
         >>> # Simple format (assumes mg/L)
@@ -184,6 +204,16 @@ def calculate_mass_balance(
     loads = {}
     
     for param, conc_data in concentrations.items():
+        # CRITICAL TYPE VALIDATION: Reject lists (common LLM mistake)
+        if isinstance(conc_data, (list, tuple)):
+            raise ValueError(
+                f"Parameter '{param}' has list/array value: {conc_data}\n"
+                f"Expected a single number, not a list.\n\n"
+                f"✅ CORRECT: {{'{param}': {conc_data[0] if conc_data else 0}}}\n"
+                f"❌ WRONG: {{'{param}': {conc_data}}}\n\n"
+                f"If you have multiple values, call this tool separately for each scenario."
+            )
+        
         # Parse concentration data (handle multiple formats)
         if isinstance(conc_data, dict):
             # Format: {"value": 3700, "unit": "mg/L"}
@@ -194,6 +224,15 @@ def calculate_mass_balance(
                 raise ValueError(
                     f"Parameter '{param}': dict format requires 'value' key. "
                     f"Got: {conc_data}"
+                )
+            
+            # CRITICAL: Validate that 'value' inside dict is not a list
+            if isinstance(value, (list, tuple)):
+                raise ValueError(
+                    f"Parameter '{param}' has nested list in 'value' field: {value}\n"
+                    f"Expected a single number.\n\n"
+                    f"✅ CORRECT: {{'{param}': {{'value': {value[0] if value else 0}, 'unit': '{unit}'}}}}\n"
+                    f"❌ WRONG: {{'{param}': {{'value': {value}, 'unit': '{unit}'}}}}"
                 )
             
         elif isinstance(conc_data, str):
@@ -651,6 +690,9 @@ def validate_treatment_efficiency(
     """
     Validate treatment train engineering LOGIC (not exact removal simulation).
     
+    **When to use:** After designing treatment train, to check engineering logic.
+    **When NOT to use:** Do not iterate to eliminate warnings - they are advisory only.
+    
     Checks if the train follows sound engineering principles without hardcoding
     specific technologies. Works for any sector and any technology combination.
     
@@ -661,11 +703,19 @@ def validate_treatment_efficiency(
     - Train complexity → Reasonable number of stages (4-8 typical)
     - Sequence logic → Pre-treatment before biological, polishing after
     
+    SUPPORTED FORMATS:
+    ✅ CORRECT train: ["Screening", "DAF", "SBR", "GAC", "UV"]
+    ✅ CORRECT influent: {"BOD": 3700, "COD": 8500, "TSS": 1500}
+    
+    REJECTED FORMATS:
+    ❌ WRONG train: "Screening + DAF + SBR"  # Must be list, not string
+    ❌ WRONG influent: {"BOD": [3700], "COD": [8500]}  # No lists in values
+    ❌ WRONG influent: {"BOD": "high"}  # Must be numeric values
+    
     Args:
-        technology_train: List of technologies in sequence
-                         Example: ["Screening", "DAF", "SBR", "GAC", "UV"]
-        influent: Dict of influent concentrations in mg/L
-                 Example: {"BOD": 3700, "COD": 8500, "TSS": 1500, "FOG": 900}
+        technology_train: List of technologies in sequence (each as string)
+        influent: Dict of influent concentrations with numeric values (mg/L)
+                 Must contain single numbers, not lists or strings
         required_removal_pct: OPTIONAL - Not used in logic validation
         effluent_limits_mg_l: OPTIONAL - Not used in logic validation
     
@@ -673,7 +723,7 @@ def validate_treatment_efficiency(
         Dict containing:
             - overall_achievable: Boolean if train logic is sound
             - validation_results: Logic check results
-            - warnings: Advisory warnings (not blocking)
+            - warnings: Advisory warnings (not blocking - OK if following proven case)
             - logic_checks: List of passed logic checks
             - technology_train: Train used
             - method: Validation method
@@ -686,6 +736,24 @@ def validate_treatment_efficiency(
         >>> result["overall_achievable"]
         True
     """
+    # CRITICAL TYPE VALIDATION: Reject lists in influent dict
+    for param, value in influent.items():
+        if isinstance(value, (list, tuple)):
+            raise ValueError(
+                f"Influent parameter '{param}' has list/array value: {value}\n"
+                f"Expected a single number for concentration.\n\n"
+                f"✅ CORRECT: {{'{param}': {value[0] if value else 0}}}\n"
+                f"❌ WRONG: {{'{param}': {value}}}\n\n"
+                f"Provide single concentration value per parameter."
+            )
+        if not isinstance(value, (int, float)):
+            raise ValueError(
+                f"Influent parameter '{param}' has invalid type: {type(value).__name__}\n"
+                f"Expected numeric value (int or float).\n\n"
+                f"✅ CORRECT: {{'{param}': 1750}}\n"
+                f"❌ WRONG: {{'{param}': {repr(value)}}}"
+            )
+    
     # Convert train to uppercase for case-insensitive matching
     train_upper = [tech.upper() for tech in technology_train]
     train_str = ' '.join(train_upper)

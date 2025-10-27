@@ -4,19 +4,20 @@ Ported from backend-chatbot with adaptations for FlexibleWaterProjectData.
 Includes proven cases tool and full engineering capabilities with deviation tracking.
 """
 
-import os
-import logging
-from typing import Dict, Any, Optional
-from dataclasses import dataclass
-from pydantic_ai import Agent, RunContext, ModelRetry
-from pydantic_ai.usage import UsageLimits
-from pydantic_ai.settings import ModelSettings
 import json
+import logging
+import os
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
+from pydantic_ai import Agent, RunContext
+from pydantic_ai.settings import ModelSettings
+from pydantic_ai.usage import UsageLimits
+
+from app.core.config import settings
 from app.models.project_input import FlexibleWaterProjectData
 from app.models.proposal_output import ProposalOutput
-from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +26,7 @@ _proven_cases_context = {}
 
 
 def _log_deviation_analysis(
-    proposal_output: ProposalOutput, client_metadata: Dict[str, Any]
+    proposal_output: ProposalOutput, client_metadata: dict[str, Any]
 ) -> None:
     """
     Analyze and log deviations between agent selection and proven cases.
@@ -61,8 +62,8 @@ def _log_deviation_analysis(
     logger.info("╠══════════════════════════════════════════════════════════════╣")
     logger.info(f"║ 📚 Proven Case: {proven_case.get('application_type', 'Unknown')}")
     logger.info(f"║    Train: {proven_train}")
-    logger.info(f"║")
-    logger.info(f"║ 🔧 Agent Selected:")
+    logger.info("║")
+    logger.info("║ 🔧 Agent Selected:")
     logger.info(f"║    Train: {selected_train_str}")
     logger.info("╠══════════════════════════════════════════════════════════════╣")
 
@@ -125,7 +126,7 @@ class ProposalContext:
     """Simple context for proposal generation"""
 
     water_data: FlexibleWaterProjectData
-    client_metadata: Dict[str, Any]
+    client_metadata: dict[str, Any]
 
 
 # Configure OpenAI API
@@ -141,11 +142,13 @@ def load_proposal_prompt() -> str:
     """
     Load water treatment proposal prompt from external markdown file.
     Follows 2025 best practices for prompt management in production AI applications.
+    
+    v4-condensed: Sector-agnostic, flexible templates, autonomous agent (263 lines)
     """
-    prompt_path = Path(__file__).parent.parent / "prompts" / "prompt-for-proposal.md"
+    prompt_path = Path(__file__).parent.parent / "prompts" / "prompt-for-proposal.v4-condensed.md"
 
     try:
-        with open(prompt_path, "r", encoding="utf-8") as f:
+        with open(prompt_path, encoding="utf-8") as f:
             content = f.read().strip()
 
         if not content:
@@ -170,7 +173,7 @@ proposal_agent = Agent(
     model_settings=ModelSettings(
         temperature=0.2,
     ),
-    retries=3,
+    retries=1,  # Reduced from 3 to prevent long retry loops
 )
 
 
@@ -226,7 +229,7 @@ CLIENT REQUIREMENTS & METADATA:
 @proposal_agent.tool(retries=2, docstring_format="google")
 async def get_proven_water_treatment_cases(
     ctx: RunContext[ProposalContext],
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Get 2-3 proven water treatment cases from similar sectors.
 
     Returns treatment trains, cost benchmarks, and specs for engineering validation.
@@ -234,6 +237,16 @@ async def get_proven_water_treatment_cases(
     Returns:
         Dict with similar_cases (list), user_sector (str), message (str).
     """
+    # LOOP PREVENTION: Check if already called for this context
+    context_key = f"{ctx.deps.client_metadata.get('company_name', 'unknown')}_{ctx.deps.client_metadata.get('selected_sector', 'unknown')}"
+
+    if context_key in _proven_cases_context:
+        logger.warning(
+            f"⚠️ LOOP DETECTED: get_proven_cases() called AGAIN for {context_key}. "
+            f"Returning cached data to prevent infinite loop."
+        )
+        return _proven_cases_context[context_key]
+
     try:
         logger.info(
             f"🔍 Accessing proven cases database for {ctx.deps.client_metadata.get('selected_sector', 'project')}"
@@ -261,9 +274,16 @@ async def get_proven_water_treatment_cases(
 
     except Exception as e:
         logger.error(f"❌ Error accessing proven cases database: {e}")
-        raise ModelRetry(
-            f"Unable to access proven cases database: {e}. The agent will design based on general engineering principles."
-        )
+        return {
+            "similar_cases": [],
+            "user_sector": ctx.deps.client_metadata.get("selected_sector", "unknown"),
+            "user_subsector": "unknown",
+            "total_found": 0,
+            "search_profile": {"total_cases": 0},
+            "message": "Database unavailable. Proceeding with general engineering analysis.",
+            "status": "fallback",
+            "error": str(e)
+        }
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -278,22 +298,47 @@ async def get_proven_water_treatment_cases(
 # ═══════════════════════════════════════════════════════════════════
 
 
-@proposal_agent.tool_plain(retries=1, docstring_format="google")
-def calculate_mass_balance(flow_m3_day: float, concentrations: Dict[str, Any]) -> Dict[str, Any]:
+@proposal_agent.tool_plain(retries=2, docstring_format="google")
+def calculate_mass_balance(flow_m3_day: float, concentrations: dict[str, Any]) -> dict[str, Any]:
     """Calculate contaminant mass loads (kg/day) from concentrations.
 
+    **When to use:** After retrieving raw influent data, as first engineering calculation.
+    **When NOT to use:** Do not call multiple times for the same influent data.
+
     Formula: Load = Flow × Concentration × 0.001
-    Accepts flexible formats (numbers, strings with units, dicts).
     Supports: mg/L, g/L, ppm, µg/L, kg/m³ (auto-converts to mg/L).
 
+    SUPPORTED FORMATS:
+    ✅ CORRECT: {"BOD": 3700, "COD": 8500, "TSS": 1200}
+    ✅ CORRECT: {"BOD": "3700 mg/L", "COD": "8.5 g/L"}
+
+    REJECTED FORMATS:
+    ❌ WRONG: {"BOD": [3700]}  # No lists/arrays
+    ❌ WRONG: {}  # Empty dict not allowed
+
     Args:
-        flow_m3_day: Flow rate (m³/day)
-        concentrations: Dict of parameters {"BOD": 3700} or {"BOD": "3700 mg/L"}
+        flow_m3_day: Flow rate in m³/day (e.g., 230.0)
+        concentrations: REQUIRED dict of parameters with single numeric values per parameter
 
     Returns:
         Dict with loads (kg/day), formulas, and conversion traces per parameter.
+        Example: {"loads": {"BOD": {"load_kg_day": 851.0, "formula": "..."}}}
+
+    Raises:
+        ValueError: If concentrations empty, contains lists, or has invalid types
     """
     from app.agents.tools.engineering_calculations import calculate_mass_balance as calc_func
+
+    # Validate concentrations is provided (FAIL FAST)
+    if not concentrations:
+        logger.error("❌ calculate_mass_balance called without concentrations - INVALID CALL")
+        raise ValueError(
+            "concentrations parameter is REQUIRED. "
+            "Cannot calculate mass balance without water quality data. "
+            "Provide dict like: {'BOD': 3700, 'COD': 8500, 'TSS': 1200} or "
+            "{'BOD': '3700 mg/L', 'COD': '8.5 g/L'}. "
+            "Example: calculate_mass_balance(flow_m3_day=230, concentrations={'BOD': 3700, 'COD': 8500})"
+        )
 
     logger.info(f"🧮 DETERMINISTIC TOOL: Calculating mass balance for flow={flow_m3_day} m³/d")
     result = calc_func(flow_m3_day, concentrations)
@@ -308,16 +353,27 @@ def size_biological_reactor(
     organic_load_kg_day: float,
     flow_m3_day: float,
     temperature_celsius: float = 25.0,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Size biological reactor (UASB, SBR, MBR, Activated Sludge).
+
+    **When to use:** Call once for the main biological reactor from proven case.
+    **When NOT to use:** Do not call multiple times unless proven case shows two-stage biological.
 
     Uses industry design criteria (Metcalf & Eddy, WEF, EPA).
     Returns volume (m³), HRT (hours), dimensions, and design criteria.
 
+    SUPPORTED FORMATS:
+    ✅ CORRECT: reactor_type="SBR", organic_load_kg_day=430.5, flow_m3_day=230
+    ✅ CORRECT: reactor_type="UASB", organic_load_kg_day=1200, flow_m3_day=350
+
+    REJECTED FORMATS:
+    ❌ WRONG: reactor_type="SBR + MBR"  # Single reactor type only
+    ❌ WRONG: organic_load_kg_day=[430, 500]  # Single number, not list
+
     Args:
-        reactor_type: "UASB", "SBR", "MBR", or "activated_sludge"
-        organic_load_kg_day: COD for anaerobic, BOD for aerobic (kg/day)
-        flow_m3_day: Flow rate (m³/day)
+        reactor_type: "UASB", "SBR", "MBR", or "activated_sludge" (single reactor type)
+        organic_load_kg_day: COD for anaerobic, BOD for aerobic (kg/day) - single number
+        flow_m3_day: Flow rate (m³/day) - single number
         temperature_celsius: Operating temp (°C, default 25)
 
     Returns:
@@ -337,11 +393,14 @@ def size_biological_reactor(
 @proposal_agent.tool_plain(retries=1, docstring_format="google")
 def validate_treatment_efficiency(
     technology_train: list,
-    influent: Dict[str, Any],
-    required_removal_pct: Optional[Dict[str, float]] = None,
-    effluent_limits_mg_l: Optional[Dict[str, float]] = None,
-) -> Dict[str, Any]:
+    influent: dict[str, Any],
+    required_removal_pct: dict[str, float] | None = None,
+    effluent_limits_mg_l: dict[str, float] | None = None,
+) -> dict[str, Any]:
     """Validate treatment train engineering LOGIC (not exact removal simulation).
+
+    **When to use:** After designing treatment train, to check engineering logic.
+    **When NOT to use:** Do not iterate to eliminate warnings - they are advisory only.
 
     Checks if train follows sound engineering principles. Works for ANY technology.
     Returns logic assessment, checks passed, and ADVISORY warnings (not blocking).
@@ -352,12 +411,20 @@ def validate_treatment_efficiency(
     - Train complexity → Reasonable stages (4-8 typical)
     - Sequence → Logical progression
 
+    SUPPORTED FORMATS:
+    ✅ CORRECT train: ["Screening", "DAF", "SBR", "GAC", "UV"]
+    ✅ CORRECT influent: {"BOD": 3700, "COD": 8500, "FOG": 900}
+
+    REJECTED FORMATS:
+    ❌ WRONG influent: {"BOD": [3700]}  # No lists in values
+    ❌ WRONG influent: {}  # Empty dict not allowed
+
     IMPORTANT: Warnings are ADVISORY only. If you followed a proven case,
     trust the proven case evidence over this logic check.
 
     Args:
-        technology_train: List of technologies ["Screening", "DAF", "SBR", "GAC", "UV"]
-        influent: Dict of concentrations {"BOD": 3700, "FOG": 900}
+        technology_train: List of technologies (each as string)
+        influent: Dict of concentrations with single numeric values per parameter
         required_removal_pct: OPTIONAL - Not used in logic validation
         effluent_limits_mg_l: OPTIONAL - Not used in logic validation
 
@@ -398,15 +465,33 @@ def validate_treatment_efficiency(
 
 @proposal_agent.tool_plain(retries=1, docstring_format="google")
 def calculate_total_capex(
-    equipment_costs: Dict[str, float], location_factor: float = 1.0
-) -> Dict[str, Any]:
+    equipment_costs: dict[str, float], location_factor: float = 1.0
+) -> dict[str, Any]:
     """Calculate total CAPEX from equipment costs with industry-standard build-up.
+
+    **When to use:** After sizing all equipment and estimating individual costs.
+    **When NOT to use:** Do not use placeholder values like "TBD" or "Unknown".
 
     Applies percentages for civil works, installation, E&I, engineering, contingency.
     Auto-detects complexity (1-3=simple, 4-5=medium, 6+=complex) for percentage scaling.
 
+    SUPPORTED FORMATS:
+    ✅ CORRECT: {"DAF Unit": 85000, "SBR Reactor": 120000, "UV System": 35000}
+    ✅ CORRECT: {"Equipment A": 50000.0, "Equipment B": 75000.0}
+
+    REJECTED FORMATS:
+    ❌ WRONG: {"DAF": "TBD", "SBR": "Unknown"}  # No string values, only numbers
+    ❌ WRONG: {"DAF": [85000, 90000]}  # No lists, single number per equipment
+    ❌ WRONG: {}  # Empty dict not allowed
+
+    CRITICAL: All values MUST be numbers (float/int). If you cannot estimate accurately:
+    - Use conservative benchmark from proven case scaled by capacity
+    - Document assumption in technical_data.assumptions
+    - Never use placeholder strings
+
     Args:
-        equipment_costs: Dict of equipment costs {"Equipment Name": cost_usd}
+        equipment_costs: Dict of equipment costs with numeric values only
+                        Format: {"Equipment Name": cost_usd}
         location_factor: Regional multiplier (default 1.0, LATAM 0.8)
 
     Returns:
@@ -440,7 +525,7 @@ def calculate_total_capex(
 
 @proposal_agent.tool_plain(retries=1, docstring_format="google")
 def calculate_annual_opex(
-    equipment_power_kw: Dict[str, float],
+    equipment_power_kw: dict[str, float],
     flow_m3_day: float,
     operating_hours_per_day: float = 24.0,
     electricity_rate_usd_kwh: float = 0.12,
@@ -449,21 +534,28 @@ def calculate_annual_opex(
     operator_annual_salary_usd: float = 25000.0,
     maintenance_pct_capex: float = 0.04,
     capex_usd: float = 0.0,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Calculate annual OPEX across 4 categories: electricity, chemicals, personnel, maintenance.
+
+    **When to use:** After calculating CAPEX, to complete financial analysis.
+    **When NOT to use:** Do not call before sizing equipment (need power data).
 
     Returns total annual cost, breakdown by category, unit cost ($/m³), and calculation trace.
 
+    CRITICAL - equipment_power_kw MUST BE DICT FORMAT:
+    ✅ CORRECT: {"DAF": 15, "SBR Blower": 30, "MBR": 20, "Pumps": 15}
+    ✅ CORRECT: {"Equipment A": 10.5, "Equipment B": 25.0, "Equipment C": 8.5}
+
+    REJECTED FORMATS:
+    ❌ WRONG: 80  # Single number - must be dict
+    ❌ WRONG: [15, 30, 20]  # List - must be dict with equipment names
+    ❌ WRONG: {"Total": 80}  # Use individual equipment names, not "Total"
+
+    You MUST create a dict with equipment names as keys and power (kW) as values.
+    If you have 4 equipment items, create dict with 4 key-value pairs.
+
     Args:
-        equipment_power_kw: REQUIRED DICT FORMAT - A dictionary mapping each equipment name to its power (kW).
-
-                           ❌ WRONG: 80 (single number)
-                           ❌ WRONG: [15, 30, 20] (list)
-                           ✅ CORRECT: {"DAF": 15, "SBR Blower": 30, "MBR": 20, "Pumps": 15}
-
-                           You MUST create a dict with equipment names as keys and power (kW) as values.
-                           If you have 4 equipment items, create dict with 4 key-value pairs.
-
+        equipment_power_kw: REQUIRED DICT - Equipment name to power mapping
         flow_m3_day: Design flow rate (m³/day)
         operating_hours_per_day: Hours/day (default 24)
         electricity_rate_usd_kwh: $/kWh (default 0.12)
@@ -497,50 +589,9 @@ def calculate_annual_opex(
     return result
 
 
-# COMMENTED OUT - Tool was being called before technical_data was ready
-# Causing ValidationError: Field required [type=missing]
-# TODO: Re-enable after fixing execution order or making technical_data optional
-#
-# @proposal_agent.tool_plain(retries=1, docstring_format="google")
-# def validate_proposal_consistency(
-#     markdown_content: str, technical_data: Dict[str, Any]
-# ) -> Dict[str, Any]:
-#     """Validate markdown numbers match JSON technical data (CAPEX, OPEX, flow).
-#
-#     Checks key values match between markdown and JSON (1% tolerance).
-#     Call before returning ProposalOutput. If inconsistent, fix and re-validate.
-#
-#     Args:
-#         markdown_content: Full markdown proposal text
-#         technical_data: TechnicalData as dict (use .model_dump())
-#
-#     Returns:
-#         Dict with consistent (bool), mismatches list, detailed_checks, recommendations.
-#     """
-#     from app.agents.tools.engineering_calculations import (
-#         validate_proposal_consistency as validate_func,
-#     )
-#
-#     logger.info("🧮 DETERMINISTIC TOOL: Validating markdown-JSON consistency")
-#     result = validate_func(markdown_content, technical_data)
-#
-#     if result["consistent"]:
-#         logger.info(f"✅ Consistency check PASSED - {result['checks_performed']} checks OK")
-#     else:
-#         logger.error(f"❌ Consistency check FAILED - {len(result['mismatches'])} mismatches found:")
-#         for mismatch in result["mismatches"]:
-#             logger.error(f"   ⚠️  {mismatch}")
-#
-#     if result["warnings"]:
-#         for warning in result["warnings"]:
-#             logger.warning(f"   ⚠️  {warning}")
-#
-#     return result
-
-
 async def generate_enhanced_proposal(
     water_data: FlexibleWaterProjectData,
-    client_metadata: Optional[Dict[str, Any]] = None,
+    client_metadata: dict[str, Any] | None = None,
 ) -> ProposalOutput:
     """
     Generate water treatment proposal using AI agent.
@@ -603,20 +654,20 @@ async def generate_enhanced_proposal(
             client_metadata=client_metadata,
         )
 
-        # Run agent with usage limits
+        # Run agent with usage limits (reduced to prevent runaway loops)
         result = await proposal_agent.run(
             "Generate a comprehensive water treatment proposal with technical specifications, cost analysis, and implementation timeline.",
             deps=context,
             usage_limits=UsageLimits(
-                request_limit=18,
-                total_tokens_limit=200000,
+                request_limit=15,       # Reduced from 18 (7 tools + 3 buffer)
+                total_tokens_limit=180000,  # Reduced from 200k (fail faster on loops)
             ),
         )
 
         # Log success with token usage
         usage = result.usage()
         if usage:
-            logger.info(f"✅ Proposal generated successfully")
+            logger.info("✅ Proposal generated successfully")
             logger.info(
                 f"📊 Token usage: {usage.total_tokens:,} / 180,000 ({usage.total_tokens / 1800:.1f}%)"
             )

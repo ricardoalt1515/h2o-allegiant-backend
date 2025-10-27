@@ -464,9 +464,15 @@ async def get_engineering_references(ctx: RunContext[ProposalContext]) -> Dict[s
     try:
         # Simple validation for critical data
         if not ctx.deps.water_data:
-            raise ModelRetry(
-                "Water project data unavailable. Proceed with general engineering analysis."
-            )
+            return {
+                "similar_cases": [],
+                "user_sector": "unknown",
+                "user_subsector": "unknown",
+                "total_found": 0,
+                "search_profile": {"total_cases": 0},
+                "message": "Water project data unavailable. Proceeding with general engineering analysis.",
+                "status": "fallback"
+            }
 
         # Load data
         kb = load_knowledge_base()
@@ -570,6 +576,13 @@ async def get_engineering_references(ctx: RunContext[ProposalContext]) -> Dict[s
 
     except Exception as e:
         logger.error(f"❌ Case filtering error: {e}")
-        raise ModelRetry(
-            "Case database temporarily unavailable. Proceed with engineering analysis using available project data and established industry practices."
-        )
+        return {
+            "similar_cases": [],
+            "user_sector": "unknown",
+            "user_subsector": "unknown",
+            "total_found": 0,
+            "search_profile": {"total_cases": 0},
+            "message": "Case database temporarily unavailable. Proceeding with general engineering analysis.",
+            "status": "fallback",
+            "error": str(e)
+        }

@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 COPY pyproject.toml .
 
-# Instalar dependencias de Python
+# Instalar dependencias de Python (usando requirements.minimal.txt)
 RUN pip install --no-cache-dir -r requirements.txt
 RUN pip install gunicorn==22.0.0
 

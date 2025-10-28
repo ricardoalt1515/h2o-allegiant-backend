@@ -7,8 +7,10 @@ import json
 import logging
 import re
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Set, Tuple
-from pydantic_ai import RunContext, ModelRetry
+from typing import Any
+
+from pydantic_ai import RunContext
+
 from app.agents.proposal_agent import ProposalContext
 
 logger = logging.getLogger("hydrous")
@@ -28,13 +30,13 @@ CONTAMINANT_TOKENS = {
 }
 
 
-def load_knowledge_base() -> Dict[str, Any]:
+def load_knowledge_base() -> dict[str, Any]:
     """Load knowledge base once"""
     global _knowledge_base
     if _knowledge_base is None:
         try:
             path = Path(__file__).parent.parent.parent / "data" / "water_treatment_knowledge.json"
-            with open(path, "r") as f:
+            with open(path) as f:
                 _knowledge_base = json.load(f)
             logger.info("✅ Knowledge base loaded")
         except Exception as e:
@@ -43,7 +45,7 @@ def load_knowledge_base() -> Dict[str, Any]:
     return _knowledge_base
 
 
-def extract_user_context(ctx: RunContext[ProposalContext]) -> Tuple[str, str]:
+def extract_user_context(ctx: RunContext[ProposalContext]) -> tuple[str, str]:
     """Extract sector and subsector from context for better matching precision"""
     water_data = ctx.deps.water_data
     client_metadata = ctx.deps.client_metadata
@@ -54,34 +56,34 @@ def extract_user_context(ctx: RunContext[ProposalContext]) -> Tuple[str, str]:
         or client_metadata.get("selected_sector", "")
         or ""
     ).lower()
-    
+
     # Extract subsector (NEW - for better precision)
     subsector = (
         getattr(water_data, 'subsector', None)  # May not exist in old data models
         or client_metadata.get("selected_subsector", "")
         or ""
     ).lower()
-    
+
     return sector, subsector
 
 
 def extract_user_keywords(
     ctx: RunContext[ProposalContext],
-) -> Tuple[List[str], List[str], Set[str]]:
+) -> tuple[list[str], list[str], set[str]]:
     """
     Extract keywords from user context with improved subsector support
     Returns: (subsector_keywords, sector_keywords, contaminant_categories)
     """
     # Extract sector and subsector
     sector, subsector = extract_user_context(ctx)
-    
+
     # Subsector keywords (higher priority for matching)
     subsector_keywords = []
     if subsector:
         # Handle underscore-separated subsectors (e.g., "food_service" -> ["food", "service"])
         subsector_words = subsector.replace("_", " ").split()
         subsector_keywords = [word for word in subsector_words if len(word) > 2]
-    
+
     # Sector keywords (lower priority)
     sector_keywords = [word for word in sector.split() if len(word) > 2] if sector else []
 
@@ -104,10 +106,10 @@ def extract_user_keywords(
 
 
 def keyword_score(
-    case: Dict[str, Any], 
-    subsector_keywords: List[str], 
-    sector_keywords: List[str], 
-    contaminant_categories: Set[str]
+    case: dict[str, Any],
+    subsector_keywords: list[str],
+    sector_keywords: list[str],
+    contaminant_categories: set[str]
 ) -> int:
     """
     Score case by keyword matches with weighted scoring
@@ -158,7 +160,7 @@ def normalize_flow_to_m3_day(value: float, unit: str) -> float:
     """
     # Normalize unit to lowercase for comparison
     unit_lower = unit.lower().strip()
-    
+
     # Conversion factors to m³/day
     conversions = {
         "m³/day": 1.0,
@@ -174,12 +176,12 @@ def normalize_flow_to_m3_day(value: float, unit: str) -> float:
         "gpm": 5.451,     # 1 GPM = 5.451 m³/day
         "mgd": 3785.41,   # 1 MGD = 3785.41 m³/day
     }
-    
+
     factor = conversions.get(unit_lower, 1.0)
     return value * factor
 
 
-def detect_user_flow(ctx: RunContext[ProposalContext]) -> Optional[float]:
+def detect_user_flow(ctx: RunContext[ProposalContext]) -> float | None:
     """
     Extract flow rate from FlexibleWaterProjectData.technical_sections.
     Searches for "Water Consumption" or "Wastewater Generated" fields.
@@ -189,7 +191,7 @@ def detect_user_flow(ctx: RunContext[ProposalContext]) -> Optional[float]:
     """
     try:
         water_data = ctx.deps.water_data
-        
+
         # Search in technical_sections (where data actually lives)
         if hasattr(water_data, 'technical_sections'):
             for section in water_data.technical_sections:
@@ -201,7 +203,7 @@ def detect_user_flow(ctx: RunContext[ProposalContext]) -> Optional[float]:
                                 value = float(field.value)
                                 unit = field.unit or "m³/day"
                                 normalized = normalize_flow_to_m3_day(value, unit)
-                                
+
                                 # Sanity check
                                 if 0.1 <= normalized <= 1_000_000:
                                     logger.info(f"✅ Flow detected: {normalized:.1f} m³/day (from {field.label}: {value} {unit})")
@@ -209,16 +211,16 @@ def detect_user_flow(ctx: RunContext[ProposalContext]) -> Optional[float]:
                             except (ValueError, TypeError) as e:
                                 logger.debug(f"⚠️ Could not parse flow from {field.label}: {e}")
                                 continue
-        
+
         logger.debug("⚠️ No flow detected in technical_sections")
         return None
-        
+
     except Exception as e:
         logger.warning(f"⚠️ Flow detection error: {e}")
         return None
 
 
-def parse_flow_range(flow_text: str) -> Optional[Tuple[float, float]]:
+def parse_flow_range(flow_text: str) -> tuple[float, float] | None:
     """
     Parse flow range from case text
     Examples: "50-150 m³/day", "100 m³/d", "50–5,000"
@@ -275,7 +277,7 @@ def is_flow_compatible(user_flow: float, case_flow_range: str) -> bool:
     return ratio < 10
 
 
-def detect_regulatory_mismatch(user_regulation: str, case_regulation: str) -> Optional[str]:
+def detect_regulatory_mismatch(user_regulation: str, case_regulation: str) -> str | None:
     """
     Detect if regulations are different and suggest adaptation type
     """
@@ -297,12 +299,12 @@ def detect_regulatory_mismatch(user_regulation: str, case_regulation: str) -> Op
 
 
 def generate_why_relevant(
-    case: Dict,
-    subsector_keywords: List[str],
-    sector_keywords: List[str],
-    contaminant_categories: Set[str],
-    user_flow: Optional[float],
-) -> List[str]:
+    case: dict,
+    subsector_keywords: list[str],
+    sector_keywords: list[str],
+    contaminant_categories: set[str],
+    user_flow: float | None,
+) -> list[str]:
     """
     Generate explanation bullets for why this case is relevant
     """
@@ -313,7 +315,7 @@ def generate_why_relevant(
     subsector_matches = [kw for kw in subsector_keywords if kw in case_type]
     if subsector_matches:
         reasons.append(f"Subsector: {'/'.join(subsector_matches)} match")
-    
+
     # Sector relevance (medium priority)
     sector_matches = [kw for kw in sector_keywords if kw in case_type]
     if sector_matches and not subsector_matches:  # Only show if no subsector match
@@ -341,7 +343,7 @@ def generate_why_relevant(
     return reasons[:3]  # Limit to 3 bullets
 
 
-def two_pass_filter(applications: List[Dict], ctx: RunContext[ProposalContext]) -> List[Dict]:
+def two_pass_filter(applications: list[dict], ctx: RunContext[ProposalContext]) -> list[dict]:
     """
     🎯 Two-Pass Intelligent Filtering System (Enhanced with Subsector Support)
 
@@ -449,7 +451,7 @@ def two_pass_filter(applications: List[Dict], ctx: RunContext[ProposalContext]) 
     return final_cases
 
 
-async def get_engineering_references(ctx: RunContext[ProposalContext]) -> Dict[str, Any]:
+async def get_engineering_references(ctx: RunContext[ProposalContext]) -> dict[str, Any]:
     """
     🎯 Two-Pass Intelligent Case Filter
 

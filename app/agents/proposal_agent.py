@@ -18,14 +18,28 @@ from pydantic_ai.usage import UsageLimits
 from app.core.config import settings
 from app.models.project_input import FlexibleWaterProjectData
 from app.models.proposal_output import ProposalOutput
+from app.services.cache_service import cache_service
 
 logger = logging.getLogger(__name__)
 
-# Thread-safe storage for proven cases consulted during generation
-_proven_cases_context = {}
 
 
-def _log_deviation_analysis(
+def _get_proven_cases_cache_key(client_metadata: dict) -> str:
+    """
+    Generate cache key for proven cases based on client metadata.
+    
+    Args:
+        client_metadata: Client metadata dict
+        
+    Returns:
+        Cache key string for Redis
+    """
+    company = client_metadata.get('company_name', 'unknown')
+    sector = client_metadata.get('selected_sector', 'unknown')
+    return f"proven_cases:{company}_{sector}"
+
+
+async def _log_deviation_analysis(
     proposal_output: ProposalOutput, client_metadata: dict[str, Any]
 ) -> None:
     """
@@ -34,9 +48,14 @@ def _log_deviation_analysis(
     This provides visibility into whether the agent is following proven precedents
     or making autonomous engineering decisions.
     """
-    # Get context key
-    context_key = f"{client_metadata.get('company_name', 'unknown')}_{client_metadata.get('selected_sector', 'unknown')}"
-    proven_cases = _proven_cases_context.get(context_key)
+    # Get cached proven cases from Redis
+    cache_key = _get_proven_cases_cache_key(client_metadata)
+
+    try:
+        proven_cases = await cache_service.get(cache_key)
+    except Exception as e:
+        logger.error(f"Error retrieving proven cases for deviation analysis: {e}")
+        proven_cases = None
 
     if not proven_cases or not proven_cases.get("similar_cases"):
         logger.info("💡 No proven cases were consulted - agent designed from first principles")
@@ -237,15 +256,21 @@ async def get_proven_water_treatment_cases(
     Returns:
         Dict with similar_cases (list), user_sector (str), message (str).
     """
-    # LOOP PREVENTION: Check if already called for this context
-    context_key = f"{ctx.deps.client_metadata.get('company_name', 'unknown')}_{ctx.deps.client_metadata.get('selected_sector', 'unknown')}"
+    # Generate cache key (DRY principle)
+    cache_key = _get_proven_cases_cache_key(ctx.deps.client_metadata)
 
-    if context_key in _proven_cases_context:
-        logger.warning(
-            f"⚠️ LOOP DETECTED: get_proven_cases() called AGAIN for {context_key}. "
-            f"Returning cached data to prevent infinite loop."
-        )
-        return _proven_cases_context[context_key]
+    # LOOP PREVENTION: Check Redis cache first
+    try:
+        cached_cases = await cache_service.get(cache_key)
+        if cached_cases:
+            logger.warning(
+                f"⚠️ LOOP DETECTED: get_proven_cases() called AGAIN for {cache_key}. "
+                f"Returning cached data to prevent infinite loop."
+            )
+            return cached_cases
+    except Exception as e:
+        logger.error(f"Error checking cache for {cache_key}: {e}")
+        # Continue with fresh lookup if cache fails
 
     try:
         logger.info(
@@ -266,9 +291,13 @@ async def get_proven_water_treatment_cases(
 
         logger.info(f"✅ Found {similar_cases_count} similar cases for sector: {sector}")
 
-        # Store cases in context using client metadata as key for later comparison
-        context_key = f"{ctx.deps.client_metadata.get('company_name', 'unknown')}_{ctx.deps.client_metadata.get('selected_sector', 'unknown')}"
-        _proven_cases_context[context_key] = cases
+        # Store cases in Redis cache with TTL (1 hour)
+        try:
+            await cache_service.set(cache_key, cases, ttl=3600)
+            logger.debug(f"Cached proven cases with key: {cache_key}")
+        except Exception as e:
+            logger.error(f"Error caching proven cases: {e}")
+            # Continue even if caching fails
 
         return cases
 
@@ -284,18 +313,6 @@ async def get_proven_water_treatment_cases(
             "status": "fallback",
             "error": str(e)
         }
-
-
-# ═══════════════════════════════════════════════════════════════════
-# 🔧 DETERMINISTIC ENGINEERING CALCULATION TOOLS
-# ═══════════════════════════════════════════════════════════════════
-# These tools provide REPRODUCIBLE engineering calculations.
-# Key characteristics:
-# - DETERMINISTIC: Same inputs → Same outputs
-# - VERIFIABLE: Show formulas and sources
-# - NO LLM: Pure mathematical calculations
-# - AUDITABLE: Full calculation trace
-# ═══════════════════════════════════════════════════════════════════
 
 
 @proposal_agent.tool_plain(retries=2, docstring_format="google")
@@ -347,7 +364,7 @@ def calculate_mass_balance(flow_m3_day: float, concentrations: dict[str, Any]) -
     return result
 
 
-@proposal_agent.tool_plain(retries=1, docstring_format="google")
+# @proposal_agent.tool_plain(retries=1, docstring_format="google")
 def size_biological_reactor(
     reactor_type: str,
     organic_load_kg_day: float,
@@ -390,7 +407,7 @@ def size_biological_reactor(
     return result
 
 
-@proposal_agent.tool_plain(retries=1, docstring_format="google")
+# @proposal_agent.tool_plain(retries=1, docstring_format="google")
 def validate_treatment_efficiency(
     technology_train: list,
     influent: dict[str, Any],
@@ -710,7 +727,7 @@ async def generate_enhanced_proposal(
 
         # Log deviation analysis (agent vs proven cases)
         try:
-            _log_deviation_analysis(result.output, client_metadata)
+            await _log_deviation_analysis(result.output, client_metadata)
         except Exception as log_error:
             logger.debug(f"Could not perform deviation analysis: {log_error}")
 

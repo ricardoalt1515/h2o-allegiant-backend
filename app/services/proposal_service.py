@@ -3,6 +3,8 @@ Proposal service for generating technical proposals using AI.
 Handles proposal generation workflow and job management.
 """
 
+import asyncio
+import logging
 import structlog
 import uuid
 from typing import Dict, Any, Optional
@@ -11,6 +13,32 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 import time
 
+# Retry logic for transient failures
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception_type,
+    before_sleep_log,
+    RetryError,
+)
+
+# OpenAI exception types for retry logic
+try:
+    from openai import (
+        APIError,
+        RateLimitError,
+        APITimeoutError,
+        APIConnectionError,
+    )
+except ImportError:
+    # Fallback for older openai versions
+    APIError = Exception
+    RateLimitError = Exception
+    APITimeoutError = Exception
+    APIConnectionError = Exception
+
+from app.core.config import settings
 from app.models.project import Project
 from app.models.proposal import Proposal
 from app.models.project_input import FlexibleWaterProjectData
@@ -19,10 +47,97 @@ from app.services.cache_service import cache_service
 from app.agents.proposal_agent import (
     generate_enhanced_proposal,
     ProposalGenerationError,
-    _proven_cases_context,
 )
 
 logger = structlog.get_logger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# RETRY WRAPPER FOR AI GENERATION
+# ═══════════════════════════════════════════════════════════════════
+# Retry only on transient errors (OpenAI rate limits, timeouts, network)
+# Do NOT retry on permanent errors (validation, schema, business logic)
+# ═══════════════════════════════════════════════════════════════════
+
+@retry(
+    # Stop after 2 attempts (1 retry)
+    stop=stop_after_attempt(2),
+    
+    # Exponential backoff: wait 4s, 8s, 10s (max)
+    wait=wait_exponential(
+        multiplier=1,
+        min=4,
+        max=10
+    ),
+    
+    # Only retry on transient OpenAI errors and timeouts
+    retry=retry_if_exception_type((
+        APIError,           # OpenAI server errors (5xx)
+        RateLimitError,     # Rate limit exceeded (429)
+        APITimeoutError,    # Request timeout
+        APIConnectionError, # Network connection issues
+        asyncio.TimeoutError, # Our custom timeout
+    )),
+    
+    # Log retry attempts for monitoring
+    before_sleep=before_sleep_log(logger, logging.WARNING),
+    
+    # Re-raise exception after all retries exhausted
+    reraise=True,
+)
+async def _generate_with_retry(
+    water_data: FlexibleWaterProjectData,
+    client_metadata: dict,
+    job_id: str,
+) -> Any:
+    """
+    Generate proposal with automatic retry on transient failures.
+    
+    This wrapper function provides resilience against:
+    - OpenAI rate limits (429)
+    - OpenAI server errors (5xx)
+    - Network timeouts
+    - Connection issues
+    
+    Permanent errors (validation, schema) are NOT retried and fail immediately.
+    
+    Args:
+        water_data: Project technical data
+        client_metadata: Client and project metadata
+        job_id: Unique job identifier for tracking
+    
+    Returns:
+        ProposalOutput from AI agent
+        
+    Raises:
+        ProposalGenerationError: After all retries exhausted
+        ValidationError: Immediate failure (no retry)
+    """
+    logger.info(f"🤖 Attempting proposal generation for job {job_id}")
+    
+    try:
+        # Add timeout to AI agent call (fail fast - 8 minutes)
+        proposal_output = await asyncio.wait_for(
+            generate_enhanced_proposal(
+                water_data=water_data,
+                client_metadata=client_metadata,
+            ),
+            timeout=480  # 8 minutes (fail before frontend 10min timeout)
+        )
+        
+        logger.info(f"✅ Proposal generated successfully for job {job_id}")
+        return proposal_output
+        
+    except asyncio.TimeoutError:
+        logger.error(f"❌ AI agent timeout after 480s for job {job_id}")
+        raise ProposalGenerationError(
+            "AI generation took too long (>8 min). "
+            "This may indicate a loop or very complex project. "
+            "Please try again or simplify requirements."
+        )
+    except Exception as e:
+        logger.warning(f"⚠️ Proposal generation attempt failed for job {job_id}: {e}")
+        raise  # Re-raise for tenacity to handle
 
 
 class ProposalService:
@@ -288,9 +403,10 @@ class ProposalService:
             
             start_time = time.time()
             try:
-                proposal_output = await generate_enhanced_proposal(
+                proposal_output = await _generate_with_retry(
                     water_data=technical_data,
                     client_metadata=client_metadata,
+                    job_id=job_id,
                 )
                 generation_duration = time.time() - start_time
 
@@ -301,16 +417,45 @@ class ProposalService:
                     duration_seconds=round(generation_duration, 2),
                 )
 
-                # Extract proven cases from context (before cleanup)
-                context_key = f"{client_metadata.get('company_name', 'unknown')}_{client_metadata.get('selected_sector', 'unknown')}"
-                proven_cases_data = _proven_cases_context.get(context_key, {})
+                # Extract proven cases from Redis cache (no more global context)
+                from app.agents.proposal_agent import _get_proven_cases_cache_key
+                cache_key = _get_proven_cases_cache_key(client_metadata)
+                try:
+                    proven_cases_data = await cache_service.get(cache_key) or {}
+                except Exception as e:
+                    logger.error(f"Error retrieving proven cases for proposal: {e}")
+                    proven_cases_data = {}
+                
+            except RetryError as e:
+                # All retry attempts failed
+                duration = time.time() - start_time
+                logger.error(
+                    "proposal_generation_failed_after_retries",
+                    exc_info=True,
+                    project_id=str(project_id),
+                    job_id=job_id,
+                    duration_seconds=round(duration, 2),
+                    attempts=2,
+                    last_error=str(e.last_attempt.exception())
+                )
+                await cache_service.set_job_status(
+                    job_id=job_id,
+                    status="failed",
+                    progress=0,
+                    current_step="Generation failed after retries",
+                    error=f"Failed after 2 attempts: {str(e.last_attempt.exception())}"
+                )
+                return
                 
             except ProposalGenerationError as e:
+                # Timeout or other non-retryable error
+                duration = time.time() - start_time
                 logger.error(
                     "proposal_generation_failed",
                     exc_info=True,
                     project_id=str(project_id),
                     job_id=job_id,
+                    duration_seconds=round(duration, 2),
                     error_type=type(e).__name__,
                     error_message=str(e)
                 )
@@ -318,7 +463,7 @@ class ProposalService:
                     job_id=job_id,
                     status="failed",
                     progress=0,
-                    current_step="Failed",
+                    current_step="Generation failed",
                     error=str(e),
                 )
                 return
@@ -362,10 +507,7 @@ class ProposalService:
                 "generation_time_seconds": round(generation_duration, 2),
             }
             
-            # ✅ Clean up proven cases context after extracting data
-            if context_key in _proven_cases_context:
-                del _proven_cases_context[context_key]
-            
+            # Note: Proven cases are now managed in Redis cache with TTL
             logger.info(
                 "ai_metadata_prepared",
                 project_id=str(project_id),

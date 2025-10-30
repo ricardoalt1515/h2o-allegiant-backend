@@ -179,45 +179,101 @@ CAPEX: $[X] | OPEX: $[X]/year ($[X]/m³)
 **Always required:**
 
 - main_equipment (min 1: type, stage, capacity, power, capex, specs, justification)
-- flow_rate_m3_day, capex_usd, annual_opex_usd, implementation_months
+- design_flow_m3_day, implementation_months
 - design_parameters (peak_factor, safety_factor, operating_hours, design_life_years)
-- problem_analysis.influent_characteristics (CRITICAL - see schema below)
-- project_objectives (min 1), assumptions (min 1), alternative_analysis (min 1)
+- project_requirements.influent_characteristics (CRITICAL - see schema below)
+- project_requirements (discharge_requirements, business_objectives, site_constraints)
+- technology_selection (selected_technologies, rejected_alternatives)
+- assumptions (min 1)
+- confidence_level ("High" | "Medium" | "Low") - REQUIRED
+
+**Required for charts:**
+
+- capex_breakdown (equipment_cost, civil_works, installation_piping, engineering_supervision, contingency)
+- opex_breakdown (electrical_energy, chemicals, personnel, maintenance_spare_parts)
+- treatment_efficiency (parameters, overall_compliance)
 
 **Optional (omit if cannot calculate):**
 
-- treatment_efficiency, capex_breakdown, opex_breakdown, payback_years
+- payback_years, annual_savings_usd, roi_percent
 
-**CRITICAL: influentCharacteristics Schema**
-
-Flow and water parameters are SEPARATE fields:
+**CRITICAL: New Structure**
 
 ```json
 {
-  "influentCharacteristics": {
-    "flowRateM3Day": 230.0, // ← Flow here (NUMBER, required)
-    "parameters": [
-      // ← Water quality here (ARRAY, required)
-      {
-        "parameter": "BOD", // NOT "name"
-        "value": 1750, // NOT "value_mg_l"
-        "unit": "mg/L", // REQUIRED
-        "target_value": 35 // OPTIONAL
+  "technicalData": {
+    "designFlowM3Day": 230.0,  // ← Design flow at TOP LEVEL (not in influent)
+    
+    "projectRequirements": {
+      "influentCharacteristics": {
+        "parameters": [  // ← Only water quality (NO flow here)
+          {"parameter": "BOD", "value": 1750, "unit": "mg/L", "targetValue": 35},
+          {"parameter": "TSS", "value": 800, "unit": "mg/L", "targetValue": 30}
+        ]
       },
-      {
-        "parameter": "TSS",
-        "value": 800,
-        "unit": "mg/L",
-        "target_value": 30
-      }
-    ]
+      "dischargeRequirements": ["BOD < 30 mg/L", "TSS < 30 mg/L"],
+      "businessObjectives": ["Reduce operating costs", "Meet regulations"],
+      "siteConstraints": ["Max area: 500 m²", "24/7 operation required"]
+    },
+    
+    "technologySelection": {
+      "selectedTechnologies": [
+        {"stage": "Secondary", "technology": "SBR", "justification": "Space-efficient..."}
+      ],
+      "rejectedAlternatives": [
+        {"technology": "MBBR", "reasonRejected": "Higher footprint required"}
+      ]
+    },
+    
+    "treatmentEfficiency": {
+      "parameters": [
+        {
+          "parameterName": "BOD",
+          "influentConcentration": 1750,  // ← FROM influentCharacteristics
+          "effluentConcentration": 28,    // ← CALCULATED after treatment
+          "removalEfficiencyPercent": 98,
+          "unit": "mg/L",
+          "treatmentStage": "secondary"
+        },
+        {
+          "parameterName": "TSS",
+          "influentConcentration": 800,
+          "effluentConcentration": 24,
+          "removalEfficiencyPercent": 97,
+          "unit": "mg/L",
+          "treatmentStage": "secondary"
+        }
+      ],
+      "overallCompliance": true,
+      "criticalParameters": ["BOD", "TSS"]
+    }
   }
 }
 ```
 
-**COMMON MISTAKE:**
-❌ WRONG: `{"parameters": [{"parameter": "Flow", "value": 230, "unit": "m³/day"}]}`
-✅ CORRECT: Flow in flowRateM3Day, only water quality in parameters (BOD, TSS, COD, FOG, etc.)
+**CRITICAL CHANGES:**
+- ❌ NO flow_rate in influentCharacteristics (only water quality parameters)
+- ✅ design_flow_m3_day at technical_data root level (single source of truth)
+- ❌ NO project_objectives (use project_requirements.business_objectives)
+- ❌ NO quality_objectives (use project_requirements.discharge_requirements)
+- ❌ NO alternative_analysis (use technology_selection.rejected_alternatives)
+- ❌ NO technology_justification (use technology_selection.selected_technologies)
+
+**TREATMENT_EFFICIENCY CRITICAL:**
+- ✅ MUST copy ALL parameters from influentCharacteristics
+- ✅ influentConcentration = value from influentCharacteristics
+- ✅ effluentConcentration = calculated after treatment (REQUIRED, not optional)
+- ✅ removalEfficiencyPercent = ((influent - effluent) / influent) * 100
+- ❌ NEVER leave influentConcentration or effluentConcentration as null or 0
+
+**FAIL-FAST REQUIREMENTS:**
+- design_flow_m3_day must be > 0
+- main_equipment must have at least 1 item
+- selected_technologies must have at least 1 item
+- discharge_requirements must have at least 1 item
+- business_objectives must have at least 1 item
+- assumptions must have at least 1 item
+- All cost values must be >= 0
 
 **Document your approach in assumptions:**
 
@@ -228,6 +284,17 @@ Flow and water parameters are SEPARATE fields:
   "Cost estimation: [method]",
   "[Other key assumptions]"
 ]
+```
+
+**Confidence level (REQUIRED):**
+
+```python
+if proven_case_similarity >= 0.85 and all_data_provided:
+    confidence_level = "High"
+elif proven_case_similarity >= 0.65 or most_data_provided:
+    confidence_level = "Medium"
+else:
+    confidence_level = "Low"
 ```
 
 </output_format>

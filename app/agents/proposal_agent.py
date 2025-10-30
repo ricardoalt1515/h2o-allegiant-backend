@@ -164,7 +164,7 @@ def load_proposal_prompt() -> str:
     
     v4-condensed: Sector-agnostic, flexible templates, autonomous agent (263 lines)
     """
-    prompt_path = Path(__file__).parent.parent / "prompts" / "prompt-for-proposal.v4-condensed.md"
+    prompt_path = Path(__file__).parent.parent / "prompts" / "prompt-for-proposal.v4.md"
 
     try:
         with open(prompt_path, encoding="utf-8") as f:

@@ -317,8 +317,6 @@ async def general_exception_handler(
     )
 
 
-# Deprecated: Simple health checks kept for backward compatibility
-# Use /health endpoint from health router for comprehensive checks
 @app.get("/ping", tags=["Health"])
 async def ping():
     """Simple ping endpoint for uptime monitoring."""

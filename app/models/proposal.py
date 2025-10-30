@@ -14,28 +14,44 @@ class Proposal(BaseModel):
     """
     Proposal model representing an AI-generated technical proposal.
     
-    Stores proposal metadata, content, and generated artifacts (charts, PDFs).
-    Uses JSON columns to store structured data from AI generation.
+    Single source of truth: All technical data stored in ai_metadata JSONB field.
+    
+    Structure:
+        ai_metadata = {
+            "proposal": {
+                "technicalData": {
+                    "mainEquipment": [...],
+                    "treatmentEfficiency": {...},
+                    "capexBreakdown": {...},
+                    "opexBreakdown": {...},
+                    "operationalData": {...},
+                    ...
+                },
+                "markdownContent": "...",
+                "confidenceLevel": "High|Medium|Low",
+                "recommendations": [...]
+            },
+            "transparency": {
+                "provenCases": [...],
+                "userSector": "...",
+                "clientMetadata": {...},
+                "generatedAt": "ISO timestamp",
+                "generationTimeSeconds": 28.5
+            }
+        }
     
     Attributes:
-        project_id: Parent project
+        project_id: Parent project UUID
         version: Proposal version (e.g., "v1.0", "v2.1")
         title: Proposal title
         proposal_type: Type (Conceptual, Technical, Detailed)
         status: Status (Draft, Current, Archived)
         author: Author name (usually "H2O Allegiant AI")
-        capex: Capital expenditure estimate
-        opex: Operational expenditure estimate
-        executive_summary: Executive summary text
-        technical_approach: Technical approach description
-        cost_breakdown: Financial breakdown (JSON)
-        implementation_plan: Implementation plan text
-        risks: List of identified risks (JSON)
-        equipment_list: List of equipment specifications (JSON)
-        treatment_efficiency: Treatment efficiency metrics (JSON)
-        operational_costs: Operational cost breakdown (JSON)
-        operational_data: Operational parameters (JSON)
-        charts_data: Chart data for visualization (JSON)
+        capex: Capital expenditure estimate (USD)
+        opex: Annual operational expenditure estimate (USD)
+        executive_summary: Executive summary text (extracted from markdown)
+        technical_approach: Full technical approach markdown
+        ai_metadata: Complete AI output + transparency metadata (JSONB)
         pdf_path: Path to generated PDF file
     """
     
@@ -89,54 +105,9 @@ class Proposal(BaseModel):
         comment="Annual operational expenditure estimate in USD",
     )
     
-    # Content Sections
+    # Content Sections (kept for summary/display)
     executive_summary = Column(Text, nullable=True)
     technical_approach = Column(Text, nullable=True)
-    implementation_plan = Column(Text, nullable=True)
-    
-    # Structured Data (JSON from AI generation)
-    cost_breakdown = Column(
-        JSON,
-        nullable=True,
-        comment="Financial breakdown: equipment_cost, civil_works, installation_piping, etc.",
-    )
-    
-    risks = Column(
-        JSON,
-        nullable=True,
-        comment="List of identified risks",
-    )
-    
-    equipment_list = Column(
-        JSON,
-        nullable=True,
-        comment="List of EquipmentSpec objects with technical details",
-    )
-    
-    treatment_efficiency = Column(
-        JSON,
-        nullable=True,
-        comment="Treatment efficiency metrics: COD, BOD, TSS, TN, TP, FOG",
-    )
-    
-    operational_costs = Column(
-        JSON,
-        nullable=True,
-        comment="Operational cost breakdown: electrical_energy, chemicals, personnel, maintenance",
-    )
-    
-    operational_data = Column(
-        JSON,
-        nullable=True,
-        comment="Operational parameters: required_area_m2, sludge_production, energy_consumption",
-    )
-    
-    # Visualizations
-    charts_data = Column(
-        JSON,
-        nullable=True,
-        comment="Chart data for visualization generation",
-    )
     
     # Generated Files
     pdf_path = Column(
@@ -145,11 +116,11 @@ class Proposal(BaseModel):
         comment="Path to generated PDF file (S3 URL or local path)",
     )
     
-    # AI transparency metadata (Phase 1) ✅
+    # Single source of truth for all technical data ✅
     ai_metadata = Column(
         JSON,
         nullable=True,
-        comment="AI reasoning metadata: usage_stats, proven_cases, deviations, assumptions, confidence_level",
+        comment="Complete AI output + transparency: {proposal: {technicalData, markdownContent, confidenceLevel}, transparency: {provenCases, generatedAt, generationTimeSeconds}}",
     )
     
     # Relationships

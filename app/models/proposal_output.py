@@ -10,8 +10,10 @@ This module contains structured Pydantic models for AI-generated proposals:
 These models define what the AI agent MUST return after analyzing user input.
 """
 
-from typing import Optional, List, Dict, Any
-from pydantic import Field
+from typing import Any, Literal
+
+from pydantic import Field, computed_field, model_validator
+
 from app.schemas.common import BaseSchema
 
 
@@ -28,41 +30,34 @@ class EquipmentSpec(BaseSchema):
     dimensions: str = Field(description="Dimensions in L x W x H format (meters)")
 
     # Technical justification (no brands)
-    justification: Optional[str] = Field(
+    justification: str | None = Field(
         default=None, description="Technical justification for equipment selection"
     )
 
     # Semantic fields for intelligent visualization
-    criticality: Optional[str] = Field(
+    criticality: str | None = Field(
         default="medium", description="Equipment criticality: high/medium/low"
     )
-    stage: Optional[str] = Field(
+    stage: str | None = Field(
         default="secondary",
         description="Treatment stage: primary/secondary/tertiary/auxiliary",
     )
-    risk_factor: Optional[float] = Field(
+    risk_factor: float | None = Field(
         default=0.5, description="Operational risk factor: 0.0-1.0"
     )
 
 
 class TreatmentParameter(BaseSchema):
-    """
-    Treatment performance for a single water quality parameter.
-
-    Supports ANY parameter from user input: BOD, COD, Chromium VI, Mercury,
-    Pharmaceuticals, PFAS, custom contaminants, etc.
-
-    This model is fully flexible and accepts any parameter name the user provides.
-    """
+    """Single water quality parameter treatment performance"""
 
     parameter_name: str = Field(
         description="Parameter name EXACTLY as provided by user (preserve casing)"
     )
-    influent_concentration: Optional[float] = Field(
-        default=None, description="Input concentration value from user data"
+    influent_concentration: float = Field(
+        gt=0, description="Input concentration value from influentCharacteristics (REQUIRED)"
     )
-    effluent_concentration: Optional[float] = Field(
-        default=None, description="Expected output concentration after treatment"
+    effluent_concentration: float = Field(
+        ge=0, description="Expected output concentration after treatment (REQUIRED)"
     )
     removal_efficiency_percent: float = Field(
         ge=0, le=100, description="Removal efficiency percentage (0-100)"
@@ -72,7 +67,7 @@ class TreatmentParameter(BaseSchema):
     )
 
     # Engineering context
-    treatment_stage: Optional[str] = Field(
+    treatment_stage: str | None = Field(
         default=None, description="Primary removal stage: primary, secondary, tertiary, advanced"
     )
 
@@ -95,14 +90,14 @@ class TreatmentEfficiency(BaseSchema):
         ... )
     """
 
-    parameters: List[TreatmentParameter] = Field(
+    parameters: list[TreatmentParameter] = Field(
         description="Treatment performance for each water quality parameter from user input"
     )
 
     overall_compliance: bool = Field(
         default=True, description="All parameters meet regulatory requirements"
     )
-    critical_parameters: Optional[List[str]] = Field(
+    critical_parameters: list[str] | None = Field(
         default=None, description="Parameters requiring special attention or close monitoring"
     )
 
@@ -114,7 +109,7 @@ class FinancialBreakdown(BaseSchema):
     civil_works: float = Field(description="Civil works")
     installation_piping: float = Field(description="Installation and piping")
     engineering_supervision: float = Field(description="Engineering and supervision")
-    contingency: Optional[float] = Field(default=None, description="Contingencies")
+    contingency: float | None = Field(default=None, description="Contingencies")
 
 
 class OperationalCosts(BaseSchema):
@@ -126,23 +121,14 @@ class OperationalCosts(BaseSchema):
     maintenance_spare_parts: float = Field(description="Annual maintenance and spare parts")
 
 
-class ClientInformation(BaseSchema):
-    """Client information"""
-
-    company_name: str = Field(description="Company name")
-    industry: str = Field(description="Industrial sector")
-    subsector: str = Field(description="Project subsector")
-    location: str = Field(description="Project location")
-
-
 class OperationalData(BaseSchema):
     """System operational data"""
 
     required_area_m2: float = Field(description="Required area in m²")
-    sludge_production_kg_day: Optional[float] = Field(
+    sludge_production_kg_day: float | None = Field(
         default=None, description="Sludge production kg/day"
     )
-    energy_consumption_kwh_m3: Optional[float] = Field(
+    energy_consumption_kwh_m3: float | None = Field(
         default=None, description="Energy consumption kWh/m³"
     )
 
@@ -165,86 +151,128 @@ class WaterParameter(BaseSchema):
     parameter: str = Field(description="Parameter name (e.g., BOD, Heavy metals, pH, Chromium)")
     value: float = Field(description="Parameter value")
     unit: str = Field(description="Unit (mg/L, unitless, °C, etc.)")
-    target_value: Optional[float] = Field(default=None, description="Target effluent value")
+    target_value: float | None = Field(default=None, description="Target effluent value")
 
 
 class InfluentCharacteristics(BaseSchema):
-    """Flexible influent characteristics for any industrial sector"""
+    """Flexible influent characteristics - water quality only (flow is in TechnicalData)"""
 
-    flow_rate_m3_day: float = Field(description="Flow rate in m³/day")
-    parameters: List[WaterParameter] = Field(
+    parameters: list[WaterParameter] = Field(
         description="Water quality parameters specific to this sector and project"
     )
 
 
-class ProblemAnalysis(BaseSchema):
-    """Detailed problem analysis data"""
+class ProjectRequirements(BaseSchema):
+    """Project requirements and constraints"""
 
     influent_characteristics: InfluentCharacteristics = Field(
-        description="Input water quality data"
+        description="Input water quality parameters"
     )
-    quality_objectives: List[str] = Field(description="Project-specific quality objectives")
-    conditions_restrictions: List[str] = Field(
-        description="Site-specific conditions and restrictions"
+    discharge_requirements: list[str] = Field(
+        min_length=1, description="Required effluent quality targets"
+    )
+    business_objectives: list[str] = Field(
+        min_length=1, description="Client business goals"
+    )
+    site_constraints: list[str] = Field(
+        description="Physical/operational constraints"
     )
 
 
-class AlternativeAnalysis(BaseSchema):
-    """Alternative technology analysis"""
+class SelectedTechnology(BaseSchema):
+    """Technology selected for treatment stage"""
 
-    technology: str = Field(description="Alternative technology considered")
-    reason_rejected: str = Field(description="Technical/economic reason for rejection")
+    stage: str = Field(description="Treatment stage: primary/secondary/tertiary")
+    technology: str = Field(description="Technology name")
+    justification: str = Field(description="Technical reasoning for selection")
 
 
-class TechnologyJustification(BaseSchema):
-    """Detailed technology selection justification"""
+class RejectedAlternative(BaseSchema):
+    """Alternative technology considered but not selected"""
 
-    technology: str = Field(description="Selected technology name")
-    alternatives_considered: List[str] = Field(description="Alternative technologies evaluated")
-    selection_criteria: str = Field(description="Primary selection criterion")
-    technical_justification: str = Field(description="Detailed technical reasoning")
+    technology: str = Field(description="Technology name")
+    reason_rejected: str = Field(description="Why it was rejected")
+    stage: str | None = Field(default=None, description="Stage it was considered for")
+
+
+class TechnologySelection(BaseSchema):
+    """Technology selection with justifications"""
+
+    selected_technologies: list[SelectedTechnology] = Field(
+        min_length=1, description="Technologies selected (at least one required)"
+    )
+    rejected_alternatives: list[RejectedAlternative] = Field(
+        description="Technologies considered but rejected"
+    )
 
 
 class TechnicalData(BaseSchema):
-    """Complete technical system data"""
+    """Complete technical system data - single source of truth"""
 
-    flow_rate_m3_day: float = Field(description="Design flow rate in m³/day")
-    main_equipment: List[EquipmentSpec] = Field(description="Main equipment list")
-    capex_usd: float = Field(description="Total capital investment in USD")
-    annual_opex_usd: float = Field(description="Annual operational costs in USD")
-    implementation_months: int = Field(description="Implementation duration in months")
+    design_flow_m3_day: float = Field(gt=0, description="Design flow rate in m³/day")
+    main_equipment: list[EquipmentSpec] = Field(
+        min_length=1, description="Main equipment list (at least one required)"
+    )
+    implementation_months: int = Field(gt=0, description="Implementation duration")
+    design_parameters: DesignParameters
+    project_requirements: ProjectRequirements
+    assumptions: list[str] = Field(min_length=1, description="Design assumptions")
+    technology_selection: TechnologySelection
+    treatment_efficiency: TreatmentEfficiency
+    capex_breakdown: FinancialBreakdown
+    opex_breakdown: OperationalCosts
+    operational_data: OperationalData
+    payback_years: float | None = None
+    annual_savings_usd: float | None = None
+    roi_percent: float | None = None
 
-    # Design parameters calculated by agent
-    design_parameters: DesignParameters = Field(description="Technical design parameters")
-    project_objectives: List[str] = Field(description="Specific project objectives from client")
+    @computed_field
+    @property
+    def capex_usd(self) -> float:
+        """Total CAPEX computed from breakdown"""
+        return sum([
+            self.capex_breakdown.equipment_cost,
+            self.capex_breakdown.civil_works,
+            self.capex_breakdown.installation_piping,
+            self.capex_breakdown.engineering_supervision,
+            self.capex_breakdown.contingency or 0,
+        ])
 
-    # Detailed analysis sections for PDF generation
-    problem_analysis: ProblemAnalysis = Field(description="Detailed problem analysis data")
-    alternative_analysis: List[AlternativeAnalysis] = Field(
-        description="Technologies considered but rejected"
-    )
-    assumptions: List[str] = Field(description="Project-specific design assumptions")
-    technology_justification: List[TechnologyJustification] = Field(
-        description="Detailed technology justifications"
-    )
+    @computed_field
+    @property
+    def annual_opex_usd(self) -> float:
+        """Total annual OPEX computed from breakdown"""
+        return sum([
+            self.opex_breakdown.electrical_energy,
+            self.opex_breakdown.chemicals,
+            self.opex_breakdown.personnel,
+            self.opex_breakdown.maintenance_spare_parts,
+        ])
 
-    # Structured information for charts
-    treatment_efficiency: TreatmentEfficiency = Field(
-        description="Treatment efficiency for all user-provided parameters"
-    )
-    capex_breakdown: FinancialBreakdown = Field(
-        description="CAPEX breakdown - REQUIRED, calculated from engineering analysis"
-    )
-    opex_breakdown: OperationalCosts = Field(
-        description="OPEX breakdown - REQUIRED, calculated from engineering analysis"
-    )
-    client_info: ClientInformation = Field(description="Client information")
-    operational_data: OperationalData = Field(description="Operational data")
+    @model_validator(mode="after")
+    def validate_costs(self) -> "TechnicalData":
+        """Validate cost breakdowns are positive"""
+        # CAPEX validation
+        if self.capex_breakdown.equipment_cost < 0:
+            raise ValueError("Equipment cost cannot be negative")
+        if self.capex_breakdown.civil_works < 0:
+            raise ValueError("Civil works cost cannot be negative")
+        if self.capex_breakdown.installation_piping < 0:
+            raise ValueError("Installation cost cannot be negative")
+        if self.capex_breakdown.engineering_supervision < 0:
+            raise ValueError("Engineering cost cannot be negative")
 
-    # Financial metrics
-    payback_years: Optional[float] = Field(default=None, description="Payback period in years")
-    annual_savings_usd: Optional[float] = Field(default=None, description="Annual savings in USD")
-    roi_percent: Optional[float] = Field(default=None, description="ROI in %")
+        # OPEX validation
+        if self.opex_breakdown.electrical_energy < 0:
+            raise ValueError("Electrical energy cost cannot be negative")
+        if self.opex_breakdown.chemicals < 0:
+            raise ValueError("Chemicals cost cannot be negative")
+        if self.opex_breakdown.personnel < 0:
+            raise ValueError("Personnel cost cannot be negative")
+        if self.opex_breakdown.maintenance_spare_parts < 0:
+            raise ValueError("Maintenance cost cannot be negative")
+
+        return self
 
 
 class ProposalOutput(BaseSchema):
@@ -258,14 +286,9 @@ class ProposalOutput(BaseSchema):
     markdown_content: str = Field(description="Proposal content in markdown format")
     technical_data: TechnicalData = Field(description="Structured technical data")
 
-    # Optional fields
-    confidence_level: Optional[str] = Field(default="High", description="Confidence level")
-    recommendations: Optional[List[str]] = Field(
+    confidence_level: Literal["High", "Medium", "Low"] = Field(
+        description="Agent's confidence in proposal (REQUIRED)"
+    )
+    recommendations: list[str] | None = Field(
         default=None, description="Additional recommendations"
     )
-
-    # Compatibility with existing charts system
-    @property
-    def data_for_charts(self) -> Dict[str, Any]:
-        """Compatibility with existing charts system"""
-        return self.technical_data.model_dump()

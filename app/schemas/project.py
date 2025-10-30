@@ -142,7 +142,9 @@ class ProjectDetail(ProjectSummary):
     """
 
     # Eager-loaded relationships
-    proposals: List[ProposalResponse] = Field(
+    # Note: We don't use List[ProposalResponse] here to avoid automatic conversion
+    # Instead, we use model_serializer to handle the conversion with snapshot
+    proposals: List = Field(
         default_factory=list,
         description="Generated proposals for this project"
     )
@@ -153,17 +155,18 @@ class ProjectDetail(ProjectSummary):
     @field_serializer('proposals')
     def serialize_proposals(self, proposals: List, _info) -> List[dict]:
         """
-        Custom serializer for proposals to ensure snapshot is included.
+        Serialize proposals (reads from ai_metadata).
         
-        Note: ProposalResponse.from_model_with_snapshot constructs
-        the snapshot field from project data.
+        Receives SQLAlchemy Proposal models.
+        All technical data is in ai_metadata.proposal.technicalData.
         """
         if not proposals:
             return []
         
         from app.schemas.proposal import ProposalResponse
+        
         return [
-            ProposalResponse.from_model_with_snapshot(p).model_dump(by_alias=True)
+            ProposalResponse.model_validate(p).model_dump(by_alias=True)
             for p in proposals
         ]
 

@@ -5,31 +5,35 @@ Handles proposal generation workflow and job management.
 
 import asyncio
 import logging
-import structlog
-import uuid
-from typing import Dict, Any, Optional
-from datetime import datetime
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
 import time
+import uuid
+from datetime import datetime
+from typing import Any
+from uuid import UUID
+
+import structlog
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 # Retry logic for transient failures
 from tenacity import (
+    RetryError,
+    before_sleep_log,
     retry,
+    retry_if_exception_type,
     stop_after_attempt,
     wait_exponential,
-    retry_if_exception_type,
-    before_sleep_log,
-    RetryError,
 )
+
+from app.core.database import AsyncSessionLocal
 
 # OpenAI exception types for retry logic
 try:
     from openai import (
-        APIError,
-        RateLimitError,
-        APITimeoutError,
         APIConnectionError,
+        APIError,
+        APITimeoutError,
+        RateLimitError,
     )
 except ImportError:
     # Fallback for older openai versions
@@ -38,16 +42,16 @@ except ImportError:
     APITimeoutError = Exception
     APIConnectionError = Exception
 
-from app.core.config import settings
+from app.agents.proposal_agent import (
+    ProposalGenerationError,
+    generate_enhanced_proposal,
+)
 from app.models.project import Project
-from app.models.proposal import Proposal
 from app.models.project_input import FlexibleWaterProjectData
+from app.models.proposal import Proposal
+from app.models.proposal_output import ProposalOutput
 from app.schemas.proposal import ProposalGenerationRequest
 from app.services.cache_service import cache_service
-from app.agents.proposal_agent import (
-    generate_enhanced_proposal,
-    ProposalGenerationError,
-)
 
 logger = structlog.get_logger(__name__)
 
@@ -62,14 +66,14 @@ logger = structlog.get_logger(__name__)
 @retry(
     # Stop after 2 attempts (1 retry)
     stop=stop_after_attempt(2),
-    
+
     # Exponential backoff: wait 4s, 8s, 10s (max)
     wait=wait_exponential(
         multiplier=1,
         min=4,
         max=10
     ),
-    
+
     # Only retry on transient OpenAI errors and timeouts
     retry=retry_if_exception_type((
         APIError,           # OpenAI server errors (5xx)
@@ -78,10 +82,10 @@ logger = structlog.get_logger(__name__)
         APIConnectionError, # Network connection issues
         asyncio.TimeoutError, # Our custom timeout
     )),
-    
+
     # Log retry attempts for monitoring
     before_sleep=before_sleep_log(logger, logging.WARNING),
-    
+
     # Re-raise exception after all retries exhausted
     reraise=True,
 )
@@ -114,7 +118,7 @@ async def _generate_with_retry(
         ValidationError: Immediate failure (no retry)
     """
     logger.info(f"🤖 Attempting proposal generation for job {job_id}")
-    
+
     try:
         # Add timeout to AI agent call (fail fast - 8 minutes)
         proposal_output = await asyncio.wait_for(
@@ -124,11 +128,11 @@ async def _generate_with_retry(
             ),
             timeout=480  # 8 minutes (fail before frontend 10min timeout)
         )
-        
+
         logger.info(f"✅ Proposal generated successfully for job {job_id}")
         return proposal_output
-        
-    except asyncio.TimeoutError:
+
+    except TimeoutError:
         logger.error(f"❌ AI agent timeout after 480s for job {job_id}")
         raise ProposalGenerationError(
             "AI generation took too long (>8 min). "
@@ -142,7 +146,7 @@ async def _generate_with_retry(
 
 class ProposalService:
     """Service for managing proposal generation."""
-    
+
     @staticmethod
     def _serialize_technical_data(project: Project) -> FlexibleWaterProjectData:
         """
@@ -165,7 +169,7 @@ class ProposalService:
         """
         # Load from JSONB data (frontend's dynamic structure)
         jsonb_sections = project.project_data.get('technical_sections') if project.project_data else None
-        
+
         if jsonb_sections:
             # ✅ User has entered dynamic data in frontend
             logger.info(
@@ -192,7 +196,7 @@ class ProposalService:
                     error_type=type(e).__name__
                 )
                 # Fall through to minimal structure
-        
+
         # No technical data exists - return minimal structure
         logger.warning(
             "no_technical_data_found",
@@ -208,7 +212,7 @@ class ProposalService:
             budget=project.budget,
             technical_sections=[],  # Empty
         )
-    
+
     @staticmethod
     async def start_proposal_generation(
         db: AsyncSession,
@@ -231,7 +235,7 @@ class ProposalService:
         """
         # Generate job ID
         job_id = f"job_{uuid.uuid4().hex[:12]}"
-        
+
         # Set initial job status
         await cache_service.set_job_status(
             job_id=job_id,
@@ -240,7 +244,7 @@ class ProposalService:
             current_step="Initializing proposal generation...",
             ttl=3600,  # 1 hour
         )
-        
+
         logger.info(
             "proposal_job_started",
             job_id=job_id,
@@ -248,13 +252,13 @@ class ProposalService:
             proposal_type=request.proposal_type,
             user_id=str(user_id)
         )
-        
+
         # Note: In production, you would trigger a background task here
         # For now, we'll store the job info and it should be processed by a worker
         # TODO: Implement Celery or FastAPI BackgroundTasks
-        
+
         return job_id
-    
+
     @staticmethod
     async def generate_proposal_async(
         db: AsyncSession,
@@ -281,16 +285,16 @@ class ProposalService:
                 progress=10,
                 current_step="Loading project data...",
             )
-            
+
             # Load project
             result = await db.execute(
                 select(Project).where(Project.id == project_id)
             )
             project = result.scalar_one_or_none()
-            
+
             if not project:
                 raise ValueError(f"Project not found: {project_id}")
-            
+
             # Load technical data
             await cache_service.set_job_status(
                 job_id=job_id,
@@ -298,7 +302,7 @@ class ProposalService:
                 progress=20,
                 current_step="Loading technical data...",
             )
-            
+
             # Serialize technical data from JSONB
             await cache_service.set_job_status(
                 job_id=job_id,
@@ -306,9 +310,9 @@ class ProposalService:
                 progress=30,
                 current_step="Preparing data for AI analysis...",
             )
-            
+
             technical_data = ProposalService._serialize_technical_data(project)
-            
+
             # ═══════════════════════════════════════════════════════════════════
             # 🔍 DETAILED LOGGING: What data is being sent to the AI agent
             # ═══════════════════════════════════════════════════════════════════
@@ -321,7 +325,7 @@ class ProposalService:
             logger.info(
                 "╚══════════════════════════════════════════════════════════════╝",
             )
-            
+
             # Log technical data summary
             logger.info(
                 "📦 TECHNICAL DATA SUMMARY",
@@ -334,26 +338,26 @@ class ProposalService:
                     technical_data.count_filled_fields() / technical_data.count_fields() * 100, 1
                 ) if technical_data.count_fields() > 0 else 0,
             )
-            
+
             # ═══════════════════════════════════════════════════════════════════
             # 🎯 CLEAN AI CONTEXT - What actually goes to the agent
             # ═══════════════════════════════════════════════════════════════════
             ai_context = technical_data.to_ai_context()
             ai_context_str = technical_data.format_ai_context_to_string(ai_context)
-            
+
             logger.info(
                 "🎯 CLEAN AI CONTEXT (no UI metadata):",
                 context_keys=list(ai_context.keys()),
                 sections_count=len([k for k, v in ai_context.items() if isinstance(v, dict)]),
                 estimated_tokens=len(ai_context_str) // 4,  # Rough estimate: 1 token ≈ 4 chars
             )
-            
+
             # Log the formatted string that will be injected (first 500 chars)
             logger.info(
                 "📝 FORMATTED CONTEXT PREVIEW (first 500 chars):",
                 preview=ai_context_str[:500] + "..." if len(ai_context_str) > 500 else ai_context_str
             )
-            
+
             # Prepare client metadata
             client_metadata = {
                 "company_name": project.client,
@@ -363,11 +367,11 @@ class ProposalService:
                 "project_name": project.name,
                 "project_type": project.project_type,
             }
-            
+
             # Add user preferences if provided
             if request.preferences:
                 client_metadata["preferences"] = request.preferences
-            
+
             # Log client metadata
             logger.info(
                 "🏢 CLIENT METADATA",
@@ -379,7 +383,7 @@ class ProposalService:
                 has_preferences=bool(request.preferences),
                 preferences=request.preferences if request.preferences else None
             )
-            
+
             # Comparison: Full model vs Clean context
             full_json = technical_data.model_dump_json(exclude_none=True)
             logger.info(
@@ -388,11 +392,11 @@ class ProposalService:
                 clean_context_chars=len(ai_context_str),
                 reduction_percent=round((1 - len(ai_context_str) / len(full_json)) * 100, 1)
             )
-            
+
             logger.info(
                 "════════════════════════════════════════════════════════════════",
             )
-            
+
             # Generate proposal with AI
             await cache_service.set_job_status(
                 job_id=job_id,
@@ -400,7 +404,7 @@ class ProposalService:
                 progress=40,
                 current_step="Generating proposal with AI (this may take 1-2 minutes)...",
             )
-            
+
             start_time = time.time()
             try:
                 proposal_output = await _generate_with_retry(
@@ -425,7 +429,7 @@ class ProposalService:
                 except Exception as e:
                     logger.error(f"Error retrieving proven cases for proposal: {e}")
                     proven_cases_data = {}
-                
+
             except RetryError as e:
                 # All retry attempts failed
                 duration = time.time() - start_time
@@ -446,7 +450,7 @@ class ProposalService:
                     error=f"Failed after 2 attempts: {str(e.last_attempt.exception())}"
                 )
                 return
-                
+
             except ProposalGenerationError as e:
                 # Timeout or other non-retryable error
                 duration = time.time() - start_time
@@ -467,7 +471,7 @@ class ProposalService:
                     error=str(e),
                 )
                 return
-            
+
             # Create proposal record
             await cache_service.set_job_status(
                 job_id=job_id,
@@ -483,76 +487,48 @@ class ProposalService:
                 .limit(1)
             )
             latest_proposal = result.scalar_one_or_none()
-            
+
             if latest_proposal:
                 # Parse version and increment
                 version_num = float(latest_proposal.version.replace("v", ""))
                 new_version = f"v{version_num + 0.1:.1f}"
             else:
                 new_version = "v1.0"
-            
-            # Extract data from proposal output
-            tech_data = proposal_output.technical_data
 
-            # Build AI metadata for transparency
-            ai_metadata = {
-                "proven_cases": proven_cases_data.get("similar_cases", []),
-                "user_sector": proven_cases_data.get("user_sector", client_metadata.get("selected_sector")),
-                "assumptions": tech_data.assumptions,
-                "alternatives": [alt.model_dump() for alt in tech_data.alternative_analysis],
-                "technology_justification": [tj.model_dump() for tj in tech_data.technology_justification],
-                "confidence_level": proposal_output.confidence_level,
-                "recommendations": proposal_output.recommendations or [],
-                "generated_at": datetime.utcnow().isoformat(),
-                "generation_time_seconds": round(generation_duration, 2),
-            }
-            
-            # Note: Proven cases are now managed in Redis cache with TTL
-            logger.info(
-                "ai_metadata_prepared",
-                project_id=str(project_id),
-                proven_cases_count=len(ai_metadata['proven_cases']),
-                alternatives_count=len(ai_metadata['alternatives']),
-                confidence_level=ai_metadata['confidence_level']
-            )
-
-            # ✅ Create proposal WITH ai_metadata in PostgreSQL (best practice)
-            proposal = Proposal(
+            # Create proposal (single serialization, no duplication)
+            proposal = create_proposal(
+                proposal_output=proposal_output,
+                proven_cases_data=proven_cases_data,
+                client_metadata=client_metadata,
+                generation_duration=generation_duration,
                 project_id=project_id,
-                version=new_version,
-                title=f"Propuesta {request.proposal_type} - {project.name}",
-                proposal_type=request.proposal_type,
-                status="Draft",
-                author="H2O Allegiant AI",
-                capex=tech_data.capex_usd,
-                opex=tech_data.annual_opex_usd,
-                executive_summary=proposal_output.markdown_content[:500],
-                technical_approach=proposal_output.markdown_content,  # Full markdown
-                # Extract structured data from Pydantic models
-                equipment_list=[eq.model_dump() for eq in tech_data.main_equipment],
-                treatment_efficiency=tech_data.treatment_efficiency.model_dump() if tech_data.treatment_efficiency else None,
-                cost_breakdown=tech_data.capex_breakdown.model_dump() if tech_data.capex_breakdown else None,
-                operational_costs=tech_data.opex_breakdown.model_dump() if tech_data.opex_breakdown else None,
-                operational_data=tech_data.operational_data.model_dump() if tech_data.operational_data else None,
-                # ✅ Save AI metadata directly in PostgreSQL (persistent, queryable, backed up)
-                ai_metadata=ai_metadata,
+                project_name=project.name,
+                request=request,
+                new_version=new_version
             )
             
+            logger.info(
+                "proposal_created",
+                project_id=str(project_id),
+                proven_cases_count=len(proposal.ai_metadata['transparency']['provenCases']),
+                confidence_level=proposal.ai_metadata['proposal']['confidenceLevel']
+            )
+
             db.add(proposal)
             await db.commit()
             await db.refresh(proposal)
-            
+
             logger.info(
                 "proposal_saved_to_database",
                 proposal_id=str(proposal.id),
                 project_id=str(project_id),
                 version=new_version,
                 proposal_type=request.proposal_type,
-                capex=tech_data.capex_usd,
-                opex=tech_data.annual_opex_usd,
+                capex=proposal.capex,
+                opex=proposal.opex,
                 has_ai_metadata=True
             )
-            
+
             # Complete job
             await cache_service.set_job_status(
                 job_id=job_id,
@@ -569,7 +545,7 @@ class ProposalService:
                     },
                 },
             )
-            
+
             logger.info(
                 "proposal_generation_completed",
                 proposal_id=str(proposal.id),
@@ -578,7 +554,7 @@ class ProposalService:
                 version=new_version,
                 total_duration_seconds=round(time.time() - start_time, 2)
             )
-        
+
         except Exception as e:
             logger.error(
                 "proposal_generation_error",
@@ -595,9 +571,9 @@ class ProposalService:
                 current_step="Failed",
                 error=str(e),
             )
-    
+
     @staticmethod
-    async def get_job_status(job_id: str) -> Optional[Dict[str, Any]]:
+    async def get_job_status(job_id: str) -> dict[str, Any] | None:
         """
         Get proposal generation job status.
         
@@ -608,6 +584,93 @@ class ProposalService:
             Job status data or None
         """
         return await cache_service.get_job_status(job_id)
+
+    @staticmethod
+    async def generate_proposal_async_wrapper(
+        project_id: uuid.UUID,
+        request: ProposalGenerationRequest,
+        job_id: str,
+        user_id: uuid.UUID,
+    ) -> None:
+        """
+        Background task wrapper - creates its own DB session.
+        
+        IMPORTANT: Background tasks should NOT receive db session from endpoint
+        because the endpoint's session closes when it returns.
+        """
+        async with AsyncSessionLocal() as db:
+            await ProposalService.generate_proposal_async(
+                db=db,
+                project_id=project_id,
+                request=request,
+                job_id=job_id,
+                user_id=user_id,
+            )
+
+
+# ============================================================================
+# HELPER FUNCTIONS - Proposal Building
+# ============================================================================
+
+def extract_summary(markdown_content: str, max_length: int = 500) -> str:
+    """Extract summary from markdown (truncates at max_length)."""
+    if not markdown_content:
+        return ""
+    return markdown_content[:max_length]
+
+
+def create_proposal(
+    proposal_output: ProposalOutput,
+    proven_cases_data: dict,
+    client_metadata: dict,
+    generation_duration: float,
+    project_id: UUID,
+    project_name: str,
+    request: ProposalGenerationRequest,
+    new_version: str
+) -> Proposal:
+    """
+    Create Proposal with JSONB-only storage (single source of truth).
+    
+    Structure:
+        ai_metadata = {
+            "proposal": {...},      # Complete AI output (ProposalOutput)
+            "transparency": {...}   # Audit metadata (cases, timing, context)
+        }
+    
+    Benefits:
+        - Single serialization (by_alias=True once)
+        - No data duplication
+        - Clear separation: AI output vs audit metadata
+    """
+    # Single serialization point (DRY principle)
+    proposal_data = proposal_output.model_dump(by_alias=True, exclude_none=True)
+    
+    # Build complete metadata: AI output + transparency
+    ai_metadata = {
+        "proposal": proposal_data,
+        "transparency": {
+            "provenCases": proven_cases_data.get("similar_cases", []),
+            "userSector": proven_cases_data.get("user_sector", client_metadata.get("selected_sector")),
+            "clientMetadata": client_metadata,
+            "generatedAt": datetime.utcnow().isoformat(),
+            "generationTimeSeconds": round(generation_duration, 2),
+        }
+    }
+    
+    return Proposal(
+        project_id=project_id,
+        version=new_version,
+        title=f"Propuesta {request.proposal_type} - {project_name}",
+        proposal_type=request.proposal_type,
+        status="Draft",
+        author="H2O Allegiant AI",
+        capex=proposal_output.technical_data.capex_usd,
+        opex=proposal_output.technical_data.annual_opex_usd,
+        executive_summary=extract_summary(proposal_output.markdown_content),
+        technical_approach=proposal_output.markdown_content,
+        ai_metadata=ai_metadata,
+    )
 
 
 # Global service instance

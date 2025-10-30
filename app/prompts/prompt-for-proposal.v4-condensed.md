@@ -109,7 +109,10 @@ Think deeply about each engineering decision and document your reasoning.
 
 1. **get_proven_cases()** - Find similar treatment systems for sector baseline
 2. **calculate_mass_balance()** - Convert concentrations to mass loads (kg/day)
-3. **calculate_total_capex()** - Estimate total project cost
+3. **calculate_total_capex(equipment_costs, location_factor)** - Estimate total project cost
+   - **CRITICAL FORMAT:** `equipment_costs` must be a dict with equipment names as keys and costs (numbers only) as values
+   - **Example:** `{"equipment_costs": {"DAF Unit": 85000, "SBR Reactor": 120000, "UV System": 35000}, "location_factor": 1.0}`
+   - **Wrong:** `{"DAF Unit": 85000, ...}` (missing equipment_costs wrapper)
 4. **calculate_annual_opex()** - Calculate operating costs (electricity, chemicals, personnel, maintenance)
 
 Use judiciously. Avoid calling same tool multiple times unless technically necessary.

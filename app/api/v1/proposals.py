@@ -108,9 +108,9 @@ async def generate_proposal(
 
     # Add background task for processing
     # Note: In production, this should be handled by Celery or similar
+    # IMPORTANT: Don't pass db session - background task will create its own
     background_tasks.add_task(
-        ProposalService.generate_proposal_async,
-        db=db,
+        ProposalService.generate_proposal_async_wrapper,
         project_id=proposal_request.project_id,
         request=proposal_request,
         job_id=job_id,
@@ -660,25 +660,10 @@ async def get_proposal_ai_metadata(
         logger.warning(f"⚠️ No AI metadata found for proposal {proposal_id}")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="No AI metadata available for this proposal. "
-                   "This proposal may have been generated before transparency features were added."
+            detail="No AI metadata available for this proposal."
         )
     
     try:
-        # Transform technology_justification from internal format to API format
-        # Internal: {technology, alternatives_considered, selection_criteria, technical_justification}
-        # API: {stage, technology, justification}
-        if "technology_justification" in ai_metadata:
-            transformed_tj = []
-            for tj in ai_metadata["technology_justification"]:
-                # Map internal fields to API fields
-                transformed_tj.append({
-                    "stage": tj.get("selection_criteria", "Treatment"),  # Use criteria as stage fallback
-                    "technology": tj.get("technology", ""),
-                    "justification": tj.get("technical_justification", "")
-                })
-            ai_metadata["technology_justification"] = transformed_tj
-        
         # Validate with Pydantic (catches corrupted data)
         validated_metadata = AIMetadataResponse(**ai_metadata)
         logger.info(

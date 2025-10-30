@@ -94,27 +94,28 @@ class ProposalJobStatus(BaseSchema):
 # No need to redefine them here - using single source of truth
 
 
-class ProposalSnapshot(BaseModel):
-    """Snapshot of proposal content for frontend display."""
-    
-    executive_summary: str = Field(default="", alias="executiveSummary")
-    technical_approach: str = Field(default="", alias="technicalApproach")
-    implementation_plan: str = Field(default="", alias="implementationPlan")
-    cost_breakdown: Optional[Dict[str, float]] = Field(default=None, alias="costBreakdown")
-    risks: List[str] = Field(default_factory=list)
-    
-    class Config:
-        populate_by_name = True
-
-
 class ProposalResponse(BaseSchema):
     """
-    Schema for proposal response.
-    Matches frontend ProposalVersion interface.
-
-    Note: Inherits from BaseSchema for camelCase serialization.
-    Fields like proposal_type, created_at, cost_breakdown serialize as
-    proposalType, createdAt, costBreakdown.
+    Schema for proposal response (simplified - reads from ai_metadata).
+    
+    Structure:
+        ai_metadata = {
+            "proposal": {
+                "technicalData": {...},
+                "markdownContent": "...",
+                "confidenceLevel": "High",
+                "recommendations": [...]
+            },
+            "transparency": {
+                "provenCases": [...],
+                "userSector": "...",
+                "clientMetadata": {...},
+                "generatedAt": "...",
+                "generationTimeSeconds": 28.5
+            }
+        }
+    
+    Frontend should read from ai_metadata.proposal.technicalData for all technical details.
     """
 
     id: UUID
@@ -126,107 +127,14 @@ class ProposalResponse(BaseSchema):
     author: str
     capex: float
     opex: float
-
-    # Snapshot for frontend display (grouped content)
-    snapshot: Optional[ProposalSnapshot] = None
+    executive_summary: str
+    technical_approach: str
     
-    # Legacy fields (kept for backward compatibility)
-    executive_summary: Optional[str] = None
-    technical_approach: Optional[str] = None
-    implementation_plan: Optional[str] = None
-
-    # Structured data (properly typed for recursive serialization)
-    cost_breakdown: Optional[FinancialBreakdown] = None
-    risks: Optional[List[str]] = None
-    equipment_list: Optional[List[EquipmentSpec]] = None
-    treatment_efficiency: Optional[TreatmentEfficiency] = None
-    operational_costs: Optional[OperationalCosts] = None
+    # Single source of truth - all data here
+    ai_metadata: Dict[str, Any]
     
-    # AI transparency data (Phase 1 - Oct 2025)
-    # Note: Using Dict because AI metadata structure is flexible
-    ai_metadata: Optional[Dict[str, Any]] = None
-
     # Files
     pdf_path: Optional[str] = None
-    
-    # ========================================================================
-    # Custom serializers for JSONB fields
-    # ========================================================================
-    
-    @field_serializer('equipment_list', when_used='json')
-    def serialize_equipment_list(self, value: Optional[List], _info):
-        """Convert equipment_list dicts to camelCase on serialization."""
-        if not value:
-            return value
-        
-        def convert_dict_keys(d: dict) -> dict:
-            """Recursively convert snake_case keys to camelCase."""
-            return {to_camel_case(k): v for k, v in d.items()}
-        
-        # If already EquipmentSpec instances, dump with aliases
-        if value and isinstance(value[0], EquipmentSpec):
-            return [eq.model_dump(by_alias=True) for eq in value]
-        
-        # If raw dicts from JSONB, convert keys
-        return [convert_dict_keys(eq) for eq in value]
-    
-    @field_serializer('treatment_efficiency', when_used='json')
-    def serialize_treatment_efficiency(self, value: Optional[Dict], _info):
-        """Treatment efficiency keys are already uppercase (COD, BOD, etc)."""
-        return value
-    
-    @field_serializer('operational_costs', when_used='json')
-    def serialize_operational_costs(self, value: Optional[Dict], _info):
-        """Convert operational_costs dict to camelCase on serialization."""
-        if not value:
-            return value
-        
-        # If already OperationalCosts instance, dump with aliases
-        if isinstance(value, OperationalCosts):
-            return value.model_dump(by_alias=True)
-        
-        # If raw dict from JSONB, convert keys
-        return {to_camel_case(k): v for k, v in value.items()}
-
-    # ========================================================================
-    # Factory method
-    # ========================================================================
-
-    @classmethod
-    def from_model_with_snapshot(cls, proposal):
-        """
-        Create ProposalResponse from SQLAlchemy model with snapshot.
-
-        Helper method to ensure snapshot is always constructed consistently.
-        """
-        # Validate base fields - field_serializers will handle JSONB conversion
-        response_data = cls.model_validate(proposal).model_dump(mode='json', by_alias=True)
-
-        # ✅ Construct snapshot from proposal fields
-        # Convert cost_breakdown to dict if it's a Pydantic model
-        cost_breakdown = proposal.cost_breakdown
-        if cost_breakdown is not None and hasattr(cost_breakdown, 'model_dump'):
-            cost_breakdown_dict = cost_breakdown.model_dump()
-            # Convert snake_case to camelCase for frontend
-            cost_breakdown = {
-                "equipmentCost": cost_breakdown_dict.get("equipment_cost"),
-                "civilWorks": cost_breakdown_dict.get("civil_works"),
-                "installationPiping": cost_breakdown_dict.get("installation_piping"),
-                "engineeringSupervision": cost_breakdown_dict.get("engineering_supervision"),
-                "contingency": cost_breakdown_dict.get("contingency")
-            }
-        elif cost_breakdown is None:
-            cost_breakdown = {}
-        
-        response_data["snapshot"] = {
-            "executiveSummary": proposal.executive_summary or "",
-            "technicalApproach": proposal.technical_approach or "",
-            "implementationPlan": proposal.implementation_plan or "",
-            "costBreakdown": cost_breakdown,
-            "risks": proposal.risks or []
-        }
-
-        return cls(**response_data)
 
 
 # ============================================================================
@@ -257,7 +165,6 @@ class UsageStatsResponse(BaseModel):
 class ProvenCaseResponse(BaseModel):
     """Proven case consulted by AI during generation."""
     
-    # ✅ Make fields optional to handle legacy data
     case_id: Optional[str] = Field(None, description="Unique case identifier")
     application_type: str = Field(..., description="Application type (e.g., Municipal)")
     treatment_train: str = Field(..., description="Treatment technologies sequence")

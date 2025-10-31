@@ -515,6 +515,27 @@ class ProposalService:
             )
 
             db.add(proposal)
+            await db.flush()  # Get ID before timeline event
+            
+            # Create timeline event
+            from app.services.timeline_service import create_timeline_event
+            await create_timeline_event(
+                db=db,
+                project_id=project_id,
+                event_type="proposal_generated",
+                title=f"Propuesta generada: {new_version}",
+                description=f"Propuesta {request.proposal_type} generada con IA",
+                actor=f"user_{user_id}",
+                metadata={
+                    "proposal_id": str(proposal.id),
+                    "version": new_version,
+                    "proposal_type": request.proposal_type,
+                    "capex": proposal.capex,
+                    "opex": proposal.opex,
+                    "generation_time": round(generation_duration, 2),
+                }
+            )
+            
             await db.commit()
             await db.refresh(proposal)
 

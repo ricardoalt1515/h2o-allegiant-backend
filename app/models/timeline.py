@@ -63,7 +63,7 @@ class TimelineEvent(BaseModel):
     )
     
     # Relationships
-    project = relationship("Project", back_populates="timeline_events")
+    project = relationship("Project", back_populates="timeline")
     
     def __repr__(self) -> str:
         return f"<TimelineEvent {self.event_type}: {self.title}>"

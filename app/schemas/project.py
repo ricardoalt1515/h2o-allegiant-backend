@@ -132,42 +132,42 @@ class ProjectDetail(ProjectSummary):
     """
     Full project details with eager-loaded relationships.
     
-    Usage:
-        - Loaded with selectinload() for proposals
-        - Technical data stored in JSONB project_data field
-        - Files and timeline loaded via separate endpoints (performance)
-    
-    Best Practice: Relationships are eagerly loaded in the query,
-    so Pydantic can serialize them directly from the model.
+    Includes proposals and recent timeline events (last 10).
+    Files loaded via separate endpoint for performance.
     """
 
-    # Eager-loaded relationships
-    # Note: We don't use List[ProposalResponse] here to avoid automatic conversion
-    # Instead, we use model_serializer to handle the conversion with snapshot
     proposals: List = Field(
         default_factory=list,
-        description="Generated proposals for this project"
+        description="Generated proposals"
     )
     
-    # Files and timeline loaded separately for performance
-    # Use dedicated endpoints: /projects/{id}/files, /projects/{id}/timeline
+    timeline: List = Field(
+        default_factory=list,
+        description="Recent activity events (last 10)"
+    )
     
     @field_serializer('proposals')
     def serialize_proposals(self, proposals: List, _info) -> List[dict]:
-        """
-        Serialize proposals (reads from ai_metadata).
-        
-        Receives SQLAlchemy Proposal models.
-        All technical data is in ai_metadata.proposal.technicalData.
-        """
+        """Serialize proposals with snapshot data."""
         if not proposals:
             return []
         
         from app.schemas.proposal import ProposalResponse
-        
         return [
             ProposalResponse.model_validate(p).model_dump(by_alias=True)
             for p in proposals
+        ]
+    
+    @field_serializer('timeline')
+    def serialize_timeline(self, events: List, _info) -> List[dict]:
+        """Serialize timeline events (last 10 for performance)."""
+        if not events:
+            return []
+        
+        from app.schemas.timeline import TimelineEventResponse
+        return [
+            TimelineEventResponse.model_validate(e).model_dump(by_alias=True)
+            for e in events[:10]  # Limit to last 10
         ]
 
 

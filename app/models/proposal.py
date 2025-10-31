@@ -4,7 +4,7 @@ Represents AI-generated technical proposals for projects.
 """
 
 from sqlalchemy import Column, Float, ForeignKey, String, Text
-from sqlalchemy.dialects.postgresql import JSON, UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import relationship
 
 from app.models.base import BaseModel
@@ -118,7 +118,7 @@ class Proposal(BaseModel):
     
     # Single source of truth for all technical data ✅
     ai_metadata = Column(
-        JSON,
+        JSONB,
         nullable=True,
         comment="Complete AI output + transparency: {proposal: {technicalData, markdownContent, confidenceLevel}, transparency: {provenCases, generatedAt, generationTimeSeconds}}",
     )

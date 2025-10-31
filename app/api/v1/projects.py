@@ -74,7 +74,7 @@ async def list_projects(
         .options(
             selectinload(Project.proposals).load_only(Proposal.id),  # Only load IDs for count
             raiseload(Project.files),
-            raiseload(Project.timeline_events),
+            raiseload(Project.timeline),
         )
     )
 
@@ -207,18 +207,11 @@ async def get_project(
     project_id: UUID = Path(description="Project unique identifier"),
 ):
     """
-    Get full project details including relationships.
-
-    Performance optimizations:
-    - Eager loads proposals (selectinload)
-    - Files and timeline loaded separately via dedicated endpoints
-    - Single query with optimized joins
-    - Technical data stored in JSONB (project_data field)
-
-    Returns 404 if project doesn't exist or user doesn't own it.
+    Get full project details including proposals and recent timeline.
+    
+    Returns last 10 timeline events (limited in serializer).
+    Use dedicated endpoint for full timeline history.
     """
-    # Get project with eager-loaded relationships
-    # ✅ Best Practice: Explicit selectinload for needed relationships
     result = await db.execute(
         select(Project)
         .where(
@@ -226,9 +219,9 @@ async def get_project(
             Project.user_id == current_user.id,
         )
         .options(
-            selectinload(Project.proposals),  # Eager load proposals
-            raiseload(Project.files),  # Not needed, loaded separately
-            raiseload(Project.timeline_events),  # Not needed, loaded separately
+            selectinload(Project.proposals),
+            selectinload(Project.timeline),
+            raiseload(Project.files),
         )
     )
     project = result.scalar_one_or_none()
@@ -240,8 +233,6 @@ async def get_project(
         )
 
     logger.info(f"📖 Project retrieved: {project.id} - {project.name}")
-
-    # ✅ Pydantic V2 automatic serialization
     return ProjectDetail.model_validate(project, from_attributes=True)
 
 
@@ -260,12 +251,9 @@ async def create_project(
     current_user: CurrentUser,
     db: AsyncDB,  # Use type alias
 ):
-    """
-    Create a new project.
-
-    All fields from ProjectCreate schema are required except those marked optional.
-    """
-    # Create project
+    """Create a new project and log timeline event."""
+    from app.services.timeline_service import create_timeline_event
+    
     new_project = Project(
         user_id=current_user.id,
         name=project_data.name,
@@ -278,16 +266,32 @@ async def create_project(
         budget=project_data.budget,
         schedule_summary=project_data.schedule_summary or "Por definir",
         tags=project_data.tags or [],
-        status="In Preparation",  # Default status for new projects
+        status="In Preparation",
         progress=0,
     )
 
     db.add(new_project)
+    await db.flush()  # Get ID before timeline event
+    
+    # Create timeline event
+    await create_timeline_event(
+        db=db,
+        project_id=new_project.id,
+        event_type="project_created",
+        title="Proyecto creado",
+        description=f"Proyecto '{new_project.name}' creado",
+        actor=current_user.email,
+        metadata={
+            "sector": new_project.sector,
+            "subsector": new_project.subsector,
+            "budget": new_project.budget,
+        }
+    )
+    
     await db.commit()
     await db.refresh(new_project)
 
     logger.info(f"✅ Project created: {new_project.id} - {new_project.name}")
-
     return ProjectDetail.model_validate(new_project)
 
 
@@ -306,12 +310,9 @@ async def update_project(
     current_user: CurrentUser,
     db: AsyncDB,  # ✅ Use type alias
 ):
-    """
-    Update project fields.
-
-    Only provided fields will be updated. Omitted fields remain unchanged.
-    """
-    # Get project
+    """Update project fields and log timeline event."""
+    from app.services.timeline_service import create_timeline_event
+    
     result = await db.execute(
         select(Project).where(
             Project.id == project_id,
@@ -328,14 +329,26 @@ async def update_project(
 
     # Update fields
     update_data = project_data.model_dump(exclude_unset=True)
+    changed_fields = list(update_data.keys())
+    
     for field, value in update_data.items():
         setattr(project, field, value)
+    
+    # Create timeline event
+    await create_timeline_event(
+        db=db,
+        project_id=project.id,
+        event_type="project_updated",
+        title="Proyecto actualizado",
+        description=f"Campos actualizados: {', '.join(changed_fields)}",
+        actor=current_user.email,
+        metadata={"changed_fields": changed_fields}
+    )
 
     await db.commit()
     await db.refresh(project)
 
     logger.info(f"✅ Project updated: {project.id}")
-
     return ProjectDetail.model_validate(project)
 
 
@@ -381,3 +394,57 @@ async def delete_project(
     logger.info(f"✅ Project deleted: {project_id}")
 
     return None
+
+
+@router.get(
+    "/{project_id}/timeline",
+    response_model=list,
+    summary="Get project timeline",
+    description="Get full project activity timeline with pagination",
+    responses={404: {"model": ErrorResponse}},
+)
+@limiter.limit("60/minute")
+async def get_project_timeline(
+    request: Request,
+    project_id: UUID,
+    current_user: CurrentUser,
+    db: AsyncDB,
+    limit: int = Query(50, ge=1, le=100, description="Max events to return"),
+):
+    """
+    Get project activity timeline.
+    
+    Returns events ordered by most recent first.
+    Useful for full audit trail or pagination.
+    """
+    from app.models.timeline import TimelineEvent
+    from app.schemas.timeline import TimelineEventResponse
+    
+    # Verify project access
+    result = await db.execute(
+        select(Project).where(
+            Project.id == project_id,
+            Project.user_id == current_user.id,
+        )
+    )
+    project = result.scalar_one_or_none()
+    
+    if not project:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Project not found",
+        )
+    
+    # Get timeline events
+    result = await db.execute(
+        select(TimelineEvent)
+        .where(TimelineEvent.project_id == project_id)
+        .order_by(TimelineEvent.created_at.desc())
+        .limit(limit)
+    )
+    events = result.scalars().all()
+    
+    return [
+        TimelineEventResponse.model_validate(e).model_dump(by_alias=True)
+        for e in events
+    ]

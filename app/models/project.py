@@ -126,12 +126,12 @@ class Project(BaseModel):
         lazy="dynamic",
     )
     
-    timeline_events = relationship(
+    timeline = relationship(
         "TimelineEvent",
         back_populates="project",
         cascade="all, delete-orphan",
         order_by="desc(TimelineEvent.created_at)",
-        lazy="dynamic",
+        lazy="selectin",  # Eager load for timeline (limited in serializer)
     )
     
     def __repr__(self) -> str:
